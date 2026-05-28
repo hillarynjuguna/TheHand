@@ -59,6 +59,7 @@ def init_schema() -> bool:
                 transcript_srt TEXT,
                 transcript_vtt TEXT,
                 transcript_json TEXT,
+                transcript_hash TEXT,
                 error TEXT,
                 duration REAL
             );
@@ -178,6 +179,8 @@ def init_schema() -> bool:
             fts_enabled = True
         except sqlite3.OperationalError:
             fts_enabled = False
+
+        ensure_column(conn, "jobs", "transcript_hash", "TEXT")
 
         for column, definition in [
             ("depends_on", "TEXT"),

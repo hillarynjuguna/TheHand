@@ -12,6 +12,7 @@ class RuntimeRouteDeps:
     whisper_bin: str
     models_dir: str
     get_whisper_bin: Callable[[], str]
+    runtime_diagnostics: Callable[[], dict]
     list_available_models: Callable[[], list[str]]
     list_db_jobs: Callable[..., list[dict]]
     search_chunks: Callable[..., list[dict]]
@@ -46,6 +47,7 @@ def create_runtime_router(deps: RuntimeRouteDeps) -> APIRouter:
             "whisper_bin": deps.whisper_bin,
             "models_dir": deps.models_dir,
             "available_models": deps.list_available_models(),
+            "runtime": deps.runtime_diagnostics(),
         }
 
     @router.get("/api/jobs")

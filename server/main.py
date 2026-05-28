@@ -64,13 +64,19 @@ from runtime.jobs.registry import SQLiteJobRegistry
 
 WHISPER_BIN = os.environ.get(
     "WHISPER_BIN",
-    str(Path.home() / "whisper.cpp" / "build" / "bin" / "whisper-cli"),
+    os.environ.get(
+        "THEHAND_WHISPER_BIN",
+        str(Path.home() / "whisper.cpp" / "build" / "bin" / "whisper-cli"),
+    ),
 )
 WHISPER_BIN_FALLBACK = str(Path.home() / "whisper.cpp" / "build" / "bin" / "main")
 
 MODELS_DIR = os.environ.get(
     "MODELS_DIR",
-    str(Path.home() / "whisper.cpp" / "models"),
+    os.environ.get(
+        "THEHAND_MODELS_DIR",
+        str(Path.home() / "whisper.cpp" / "models"),
+    ),
 )
 
 FRONTEND_DIR = os.environ.get(
@@ -87,6 +93,7 @@ media_execution = LocalMediaExecutionProvider(
         whisper_bin_fallback=WHISPER_BIN_FALLBACK,
         models_dir=MODELS_DIR,
         temp_dir=TEMP_DIR,
+        cache_dir=runtime_store.DATA_DIR / "huggingface",
     )
 )
 transcript_artifact_store = TranscriptArtifactStore(runtime_store.JOB_ARTIFACTS_DIR)
@@ -265,6 +272,132 @@ def list_job_artifacts(job_id: str) -> list[dict]:
 def persist_artifact_content(job_id: str, artifact_id: str, content: str, metadata: dict | None = None) -> None:
     artifacts_repo.persist_artifact_content(job_id, artifact_id, content, metadata, _current_timestamp())
 
+
+async def generate_artifact_job(
+    artifact_id: str,
+    job_id: str,
+    artifact_type: str,
+    generation_model: Optional[str] = None,
+) -> None:
+    try:
+        update_artifact_record(
+            artifact_id,
+            {
+                "generation_status": "running",
+                "generation_model": generation_model,
+                "generation_started_at": _current_timestamp(),
+                "_transition_reason": "artifact generation started",
+                "_transition_source": "artifact_generator",
+            },
+        )
+        await broadcast_to_job(
+            job_id,
+            {
+                "type": "artifact_update",
+                "artifact_id": artifact_id,
+                "artifact_type": artifact_type,
+                "status": "running",
+                "progress": 10,
+            },
+        )
+        record_artifact_event(artifact_id, job_id, "artifact_started", "running", {"artifact_type": artifact_type})
+
+        job = fetch_db_job(job_id)
+        if not job:
+            raise RuntimeError(f"Job {job_id} not found")
+        transcript = job.get("transcript") or {}
+        chunks = chunks_repo.list_chunks(
+            job_id=job_id,
+            search=None,
+            status=None,
+            top_k=500,
+            offset=0,
+            fts_enabled=FTS_ENABLED,
+        )
+
+        async def emit_progress(progress: int, note: str) -> None:
+            await broadcast_to_job(
+                job_id,
+                {
+                    "type": "artifact_update",
+                    "artifact_id": artifact_id,
+                    "artifact_type": artifact_type,
+                    "status": "running",
+                    "progress": progress,
+                },
+            )
+            record_artifact_event(artifact_id, job_id, "artifact_progress", str(progress), {"note": note})
+
+        content, metadata = await generate_artifact_content(artifact_type, transcript, chunks, emit_progress)
+        update_artifact_record(
+            artifact_id,
+            {
+                "generation_status": "persisting",
+                "_transition_reason": "persisting artifact content",
+                "_transition_source": "artifact_generator",
+            },
+        )
+        await broadcast_to_job(
+            job_id,
+            {
+                "type": "artifact_update",
+                "artifact_id": artifact_id,
+                "artifact_type": artifact_type,
+                "status": "persisting",
+                "progress": 90,
+            },
+        )
+        persist_artifact_content(job_id, artifact_id, content, metadata)
+        update_artifact_record(
+            artifact_id,
+            {
+                "content": content,
+                "metadata_json": json.dumps(metadata or {}, ensure_ascii=False),
+                "generation_status": "done",
+                "generation_completed_at": _current_timestamp(),
+                "_transition_reason": "artifact generation completed",
+                "_transition_source": "artifact_generator",
+            },
+        )
+        record_artifact_event(artifact_id, job_id, "artifact_completed", "done", {"artifact_type": artifact_type})
+        await broadcast_to_job(
+            job_id,
+            {
+                "type": "artifact_update",
+                "artifact_id": artifact_id,
+                "artifact_type": artifact_type,
+                "status": "done",
+                "progress": 100,
+            },
+        )
+    except Exception as exc:
+        logging.exception("Artifact generation failed for %s", artifact_id)
+        try:
+            update_artifact_record(
+                artifact_id,
+                {
+                    "generation_status": "error",
+                    "generation_error": str(exc),
+                    "generation_completed_at": _current_timestamp(),
+                    "_transition_reason": "artifact generation failed",
+                    "_transition_source": "artifact_generator",
+                },
+            )
+            record_artifact_event(artifact_id, job_id, "artifact_failed", "error", {"error": str(exc)})
+            await broadcast_to_job(
+                job_id,
+                {
+                    "type": "artifact_update",
+                    "artifact_id": artifact_id,
+                    "artifact_type": artifact_type,
+                    "status": "error",
+                    "error": str(exc),
+                },
+            )
+        except Exception:
+            logging.exception("Failed to persist artifact error for %s", artifact_id)
+
+
 app = FastAPI(title="TheHand Transcription Server", version="1.0.0")
 
 init_db()
@@ -303,6 +436,42 @@ def get_model_path(model_name: str) -> str:
 
 def list_available_models() -> list[str]:
     return media_execution.list_available_models()
+
+
+def runtime_diagnostics() -> dict:
+    diagnostics: dict = {
+        "yt_dlp_ready": False,
+        "yt_dlp_command": None,
+        "ffmpeg_ready": False,
+        "ffmpeg_bin": None,
+        "whisper_ready": False,
+        "faster_whisper_ready": media_execution.has_faster_whisper(),
+        "whisper_error": None,
+        "models_ready": False,
+        "available_models": [],
+    }
+    try:
+        diagnostics["yt_dlp_command"] = media_execution.build_ytdlp_executable()
+        diagnostics["yt_dlp_ready"] = True
+    except Exception as exc:
+        diagnostics["yt_dlp_error"] = str(exc)
+    try:
+        diagnostics["ffmpeg_bin"] = media_execution.get_ffmpeg_bin()
+        diagnostics["ffmpeg_ready"] = True
+    except Exception as exc:
+        diagnostics["ffmpeg_error"] = str(exc)
+    try:
+        diagnostics["whisper_bin"] = media_execution.get_whisper_bin()
+        diagnostics["whisper_ready"] = True
+    except Exception as exc:
+        diagnostics["whisper_error"] = str(exc)
+        diagnostics["whisper_engine"] = "faster-whisper" if diagnostics["faster_whisper_ready"] else "unavailable"
+    else:
+        diagnostics["whisper_engine"] = "whisper.cpp"
+    models = media_execution.list_available_models()
+    diagnostics["available_models"] = models
+    diagnostics["models_ready"] = bool(models)
+    return diagnostics
 
 
 def update_job(job_id: str, **kwargs):
@@ -459,7 +628,11 @@ async def run_transcription_job(job_id: str, url: Optional[str], file_path: Opti
             logging.exception(f"Failed to start postprocessing for {job_id}: {e}")
 
     except Exception as exc:
-        update_job(job_id, status="error", error=str(exc))
+        current = job_registry.get_active_snapshot(job_id) or fetch_db_job(job_id) or {}
+        if current.get("status") in JOB_TERMINAL_STATUSES:
+            logging.exception("Post-terminal job error for %s: %s", job_id, exc)
+        else:
+            update_job(job_id, status="error", error=str(exc))
     finally:
         # Clean up temp files (keep job metadata)
         cleanup_job(job_id)
@@ -559,6 +732,7 @@ app.include_router(create_runtime_router(RuntimeRouteDeps(
     whisper_bin=WHISPER_BIN,
     models_dir=MODELS_DIR,
     get_whisper_bin=get_whisper_bin,
+    runtime_diagnostics=runtime_diagnostics,
     list_available_models=list_available_models,
     list_db_jobs=list_db_jobs,
     search_chunks=search_chunks,

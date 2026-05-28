@@ -4,3 +4,4 @@ __pycache__/
 .venv/
 app/dist/
 server/data/
+server/tmp/

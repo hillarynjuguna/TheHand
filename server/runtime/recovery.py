@@ -47,20 +47,22 @@ def recover_interrupted_runtime(timestamp: str) -> dict[str, Any]:
                 "SELECT artifact_id, job_id, generation_status FROM artifacts WHERE generation_status = ?;",
                 (ARTIFACT_STATUS_RUNNING,),
             ).fetchall()
-            for row in orphaned_jobs:
-                transition_state(
-                    entity_type=ENTITY_JOB,
-                    entity_id=row["job_id"],
-                    current_state=row["status"],
-                    next_state="error",
-                    reason="server restarted while job was pending",
-                    source="startup_recovery",
-                    actor="runtime",
-                )
             conn.execute(
                 "UPDATE jobs SET status = 'error', error = 'Server restarted while job was pending.', updated_at = ? WHERE status IN ('queued', 'running');",
                 (timestamp,),
             )
+
+        for row in orphaned_jobs:
+            transition_state(
+                entity_type=ENTITY_JOB,
+                entity_id=row["job_id"],
+                current_state=row["status"],
+                next_state="error",
+                reason="server restarted while job was pending",
+                source="startup_recovery",
+                actor="runtime",
+            )
+
         return {
             "timestamp": timestamp,
             "orphaned_jobs": [dict(row) for row in orphaned_jobs],
