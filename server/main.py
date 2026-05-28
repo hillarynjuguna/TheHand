@@ -75,6 +75,8 @@ FTS_ENABLED = False
 
 # In-memory job store
 jobs: dict[str, dict] = {}
+# WebSocket connections per job_id for pushing real-time events
+WS_CONNECTIONS: dict[str, list[WebSocket]] = {}
 
 # ---------------------------------------------------------------------------
 # Persistence helpers
@@ -153,6 +155,16 @@ def init_db() -> None:
                     version_number INTEGER,
                     content TEXT,
                     metadata_json TEXT,
+                    created_at TEXT,
+                    FOREIGN KEY(artifact_id) REFERENCES artifacts(artifact_id)
+                );
+                CREATE TABLE IF NOT EXISTS artifact_events (
+                    event_id TEXT PRIMARY KEY,
+                    artifact_id TEXT,
+                    job_id TEXT,
+                    event_type TEXT,
+                    status TEXT,
+                    detail_json TEXT,
                     created_at TEXT,
                     FOREIGN KEY(artifact_id) REFERENCES artifacts(artifact_id)
                 );
@@ -489,6 +501,33 @@ def create_artifact_record(job_id: str, artifact_type: str, title: str | None, c
         )
         conn.commit()
     return artifact_id
+
+
+def record_artifact_event(artifact_id: str, job_id: str, event_type: str, status: str, detail: dict | None = None) -> None:
+    event_id = str(uuid.uuid4())
+    ts = _current_timestamp()
+    with DB_LOCK, get_db_connection() as conn:
+        conn.execute(
+            "INSERT INTO artifact_events (event_id, artifact_id, job_id, event_type, status, detail_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?);",
+            (event_id, artifact_id, job_id, event_type, status, json.dumps(detail or {}), ts),
+        )
+        conn.commit()
+
+
+async def broadcast_to_job(job_id: str, message: dict) -> None:
+    """Send a JSON message to all connected websockets for a job."""
+    conns = WS_CONNECTIONS.get(job_id, [])
+    if not conns:
+        return
+    to_remove: list[WebSocket] = []
+    for ws in list(conns):
+        try:
+            await ws.send_json(message)
+        except Exception:
+            to_remove.append(ws)
+    # cleanup closed sockets
+    if to_remove:
+        WS_CONNECTIONS[job_id] = [w for w in conns if w not in to_remove]
 
 
 def update_artifact_record(artifact_id: str, updates: dict) -> None:
@@ -1069,6 +1108,15 @@ async def generate_artifact_job(artifact_id: str, job_id: str, artifact_type: st
     """Background generator — mocked heuristics that produce artifact content and persist it."""
     try:
         update_artifact_record(artifact_id, {'generation_status': 'running', 'generation_attempts': 1, 'generation_started_at': _current_timestamp()})
+        # emit queued -> running event
+        record_artifact_event(artifact_id, job_id, 'artifact_update', 'running', {'stage': 'start'})
+        await broadcast_to_job(job_id, {
+            'type': 'artifact_update',
+            'artifact_id': artifact_id,
+            'artifact_type': artifact_type,
+            'status': 'running',
+            'progress': 10,
+        })
 
         # load transcript and chunks
         job = fetch_db_job(job_id)
@@ -1085,6 +1133,9 @@ async def generate_artifact_job(artifact_id: str, job_id: str, artifact_type: st
 
         if artifact_type == 'summary':
             if chunks_rows:
+                # simulate progress
+                await broadcast_to_job(job_id, {'type': 'artifact_update','artifact_id': artifact_id,'artifact_type': artifact_type,'status': 'running','progress': 40})
+                record_artifact_event(artifact_id, job_id, 'artifact_progress', '40', {'note': 'assembling summary from chunks'})
                 summary = '\n\n'.join([c['text'] for c in chunks_rows[:3]])
             else:
                 summary = (transcript.get('text') or '')[:1600]
@@ -1094,6 +1145,9 @@ async def generate_artifact_job(artifact_id: str, job_id: str, artifact_type: st
         elif artifact_type == 'chapter_map':
             chapters = []
             if chunks_rows:
+                # simulate progress
+                await broadcast_to_job(job_id, {'type': 'artifact_update','artifact_id': artifact_id,'artifact_type': artifact_type,'status': 'running','progress': 35})
+                record_artifact_event(artifact_id, job_id, 'artifact_progress', '35', {'note': 'clustering chunks for chapters'})
                 # group by every ~5 chunks as simple chapter heuristic
                 chunk_group = 5
                 for i in range(0, len(chunks_rows), chunk_group):
@@ -1107,6 +1161,8 @@ async def generate_artifact_job(artifact_id: str, job_id: str, artifact_type: st
 
         elif artifact_type == 'entities':
             text = '\n'.join([c['text'] for c in chunks_rows]) if chunks_rows else (transcript.get('text') or '')
+            await broadcast_to_job(job_id, {'type': 'artifact_update','artifact_id': artifact_id,'artifact_type': artifact_type,'status': 'running','progress': 30})
+            record_artifact_event(artifact_id, job_id, 'artifact_progress', '30', {'note': 'scanning for entities'})
             # naive entity extraction: capitalized words frequency
             import re
             words = re.findall(r"\b([A-Z][a-z]{2,})\b", text)
@@ -1119,6 +1175,8 @@ async def generate_artifact_job(artifact_id: str, job_id: str, artifact_type: st
 
         elif artifact_type == 'topics':
             text = '\n'.join([c['text'] for c in chunks_rows]) if chunks_rows else (transcript.get('text') or '')
+            await broadcast_to_job(job_id, {'type': 'artifact_update','artifact_id': artifact_id,'artifact_type': artifact_type,'status': 'running','progress': 30})
+            record_artifact_event(artifact_id, job_id, 'artifact_progress', '30', {'note': 'extracting topic words'})
             # naive topic extraction: top words excluding stopwords
             stop = set(['the','and','for','with','that','this','have','from','are','was','were','what','which','when','where','you','your','will','shall','but','not','can','have','has'])
             import re
@@ -1133,6 +1191,8 @@ async def generate_artifact_job(artifact_id: str, job_id: str, artifact_type: st
 
         elif artifact_type == 'quotes':
             text = '\n'.join([c['text'] for c in chunks_rows]) if chunks_rows else (transcript.get('text') or '')
+            await broadcast_to_job(job_id, {'type': 'artifact_update','artifact_id': artifact_id,'artifact_type': artifact_type,'status': 'running','progress': 30})
+            record_artifact_event(artifact_id, job_id, 'artifact_progress', '30', {'note': 'finding quotes'})
             import re
             quotes = re.findall(r'"([^"]{20,200})"', text)
             quotes = quotes[:80]
@@ -1143,7 +1203,9 @@ async def generate_artifact_job(artifact_id: str, job_id: str, artifact_type: st
             content = f"Unsupported artifact type: {artifact_type}"
             metadata = {'method': 'none'}
 
-        # persist
+        # persist (simulate finalizing)
+        await broadcast_to_job(job_id, {'type': 'artifact_update','artifact_id': artifact_id,'artifact_type': artifact_type,'status': 'persisting','progress': 90})
+        record_artifact_event(artifact_id, job_id, 'artifact_progress', '90', {'note': 'persisting artifact'})
         start_ts = datetime.utcnow()
         persist_artifact_content(job_id, artifact_id, content, metadata)
         # update artifact record and add a version
@@ -1154,6 +1216,9 @@ async def generate_artifact_job(artifact_id: str, job_id: str, artifact_type: st
             conn.execute("UPDATE artifacts SET generation_attempts = generation_attempts + 1 WHERE artifact_id = ?;", (artifact_id,))
             conn.commit()
         logging.info(f"Artifact {artifact_id} generated in {duration_ms}ms")
+        # broadcast completion
+        record_artifact_event(artifact_id, job_id, 'artifact_complete', 'done', {'duration_ms': duration_ms})
+        await broadcast_to_job(job_id, {'type': 'artifact_complete','artifact_id': artifact_id,'artifact_type': artifact_type,'status': 'done','progress': 100})
 
     except Exception as exc:
         update_artifact_record(artifact_id, {'generation_status': 'error', 'generation_error': str(exc), 'content': ''})
@@ -1218,6 +1283,8 @@ async def job_progress_ws(websocket: WebSocket, job_id: str):
     Closes automatically when job is done or errors.
     """
     await websocket.accept()
+    # register websocket
+    WS_CONNECTIONS.setdefault(job_id, []).append(websocket)
     try:
         while True:
             if job_id not in jobs:
@@ -1243,7 +1310,15 @@ async def job_progress_ws(websocket: WebSocket, job_id: str):
     except WebSocketDisconnect:
         pass
     finally:
-        await websocket.close()
+        # remove websocket from registry
+        try:
+            WS_CONNECTIONS[job_id] = [w for w in WS_CONNECTIONS.get(job_id, []) if w is not websocket]
+        except Exception:
+            pass
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
