@@ -30,7 +30,7 @@ const STEP_KEY_TO_INDEX: Record<string, number> = {
   output: 3,
 };
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:8080';
+const API_BASE = import.meta.env.VITE_API_BASE ?? (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8080');
 
 type HeroProps = {
   onJobDone?: () => void;
@@ -135,9 +135,9 @@ export default function Hero({ onJobDone }: HeroProps) {
       .then((response) => (response.ok ? response.json() : Promise.reject()))
       .then((data: { whisper_ready?: boolean }) => {
         const ready = data.whisper_ready === true;
-        setServerOk(ready);
+        setServerOk(true); // Server is reachable!
         setConnectionMode(ready ? 'online' : 'demo');
-        setRuntimeMessage(ready ? 'Whisper runtime is reachable and ready.' : 'Backend not ready; demo pipeline is available.');
+        setRuntimeMessage(ready ? 'Whisper runtime is reachable and ready.' : 'Backend online but Whisper not ready; demo pipeline is available.');
       })
       .catch(() => {
         setServerOk(false);
@@ -149,8 +149,6 @@ export default function Hero({ onJobDone }: HeroProps) {
   useEffect(() => {
     const tl = gsap.timeline({ delay: 0.15 });
     if (cardRef.current) tl.from(cardRef.current, { y: 24, opacity: 0, duration: 0.8, ease: 'power3.out' });
-    if (inputRef.current) tl.from(inputRef.current, { y: 14, opacity: 0, duration: 0.45, ease: 'power3.out' }, '-=0.35');
-    if (btnRef.current) tl.from(btnRef.current, { y: 14, opacity: 0, duration: 0.45, ease: 'power3.out' }, '-=0.3');
   }, []);
 
   useEffect(

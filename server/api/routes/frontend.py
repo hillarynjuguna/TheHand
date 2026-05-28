@@ -17,6 +17,9 @@ def register_frontend_routes(app: FastAPI, frontend_dir: str) -> None:
         async def serve_spa(full_path: str):
             if full_path.startswith("api/") or full_path.startswith("ws/"):
                 raise HTTPException(status_code=404)
+            target_file = frontend_path / full_path
+            if target_file.is_file():
+                return FileResponse(str(target_file))
             index = frontend_path / "index.html"
             if index.exists():
                 return FileResponse(str(index))
