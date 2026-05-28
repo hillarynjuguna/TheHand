@@ -39,6 +39,8 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, W
 from semantic import build_embedding, chunk_transcript, cosine_similarity
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from runtime import events as runtime_events
+from runtime import bus as runtime_bus
 from fastapi.staticfiles import StaticFiles
 
 # ---------------------------------------------------------------------------
@@ -202,6 +204,11 @@ def init_db() -> None:
         )
         conn.commit()
         conn.close()
+    # ensure runtime events table exists
+    try:
+        runtime_events.init_runtime_events_table()
+    except Exception:
+        pass
 
 
 def _upsert_search_index(conn: sqlite3.Connection, job: dict) -> None:
@@ -512,6 +519,22 @@ def record_artifact_event(artifact_id: str, job_id: str, event_type: str, status
             (event_id, artifact_id, job_id, event_type, status, json.dumps(detail or {}), ts),
         )
         conn.commit()
+    # emit a canonical runtime event as well
+    try:
+        runtime_events.emit_event({
+            'job_id': job_id,
+            'artifact_id': artifact_id,
+            'entity_type': 'artifact',
+            'event_type': event_type,
+            'source': 'artifact_projection',
+            'state_from': None,
+            'state_to': status,
+            'correlation_id': None,
+            'causation_id': None,
+            'payload': detail or {},
+        })
+    except Exception:
+        pass
 
 
 async def broadcast_to_job(job_id: str, message: dict) -> None:
@@ -1084,6 +1107,20 @@ async def api_list_job_artifacts(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
     arts = list_job_artifacts(job_id)
     return {"artifacts": arts}
+
+
+@app.get("/api/runtime/events")
+async def api_runtime_events(job_id: Optional[str] = None, limit: int = 200):
+    """Fetch canonical runtime events (append-only)."""
+    rows = runtime_events.fetch_events(job_id=job_id, limit=limit)
+    return {"events": rows}
+
+
+@app.get("/api/artifact/{artifact_id}/events")
+async def api_artifact_events(artifact_id: str, limit: int = 200):
+    with DB_LOCK, get_db_connection() as conn:
+        rows = conn.execute("SELECT event_id, artifact_id, job_id, event_type, status, detail_json, created_at FROM artifact_events WHERE artifact_id = ? ORDER BY created_at DESC LIMIT ?;", (artifact_id, limit)).fetchall()
+        return {"events": [dict(r) for r in rows]}
 
 
 @app.get("/api/artifact/{artifact_id}")
