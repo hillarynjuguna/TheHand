@@ -40,7 +40,28 @@ from semantic import build_embedding, chunk_transcript, cosine_similarity
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from runtime import events as runtime_events
-from runtime import bus as runtime_bus
+from runtime import store as runtime_store
+from runtime import lineage as runtime_lineage
+from runtime import snapshots as runtime_snapshots
+from runtime import execution_store
+from runtime.generators import generate_artifact_content
+from runtime.orchestration import default_artifact_types, enqueue_background_task, runtime_queue_snapshot
+from runtime.repositories import artifacts as artifacts_repo
+from runtime.repositories import chunks as chunks_repo
+from runtime.repositories import jobs as jobs_repo
+from runtime.repositories import events as events_repo
+from runtime.schema import (
+    ENTITY_ARTIFACT,
+    ENTITY_JOB,
+    EVENT_CATEGORY_ARTIFACT,
+    create_event,
+    legacy_websocket_message,
+    websocket_event,
+)
+from runtime.state import JOB_TERMINAL_STATUSES, create_queued_job
+from runtime.state_machine import transition_state
+from runtime.transport import JobWebSocketTransport, build_job_snapshot
+from runtime import recovery as runtime_recovery
 from fastapi.staticfiles import StaticFiles
 
 # ---------------------------------------------------------------------------
@@ -67,18 +88,17 @@ TEMP_DIR = Path(tempfile.gettempdir()) / "thehand"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 # Persistent storage and artifacts
-DATA_DIR = Path(__file__).parent / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-DATABASE_PATH = DATA_DIR / "thehand.db"
-JOB_ARTIFACTS_DIR = DATA_DIR / "jobs"
-JOB_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-DB_LOCK = threading.Lock()
+DATA_DIR = runtime_store.DATA_DIR
+DATABASE_PATH = runtime_store.DATABASE_PATH
+JOB_ARTIFACTS_DIR = runtime_store.JOB_ARTIFACTS_DIR
+DB_LOCK = runtime_store.DB_LOCK
 FTS_ENABLED = False
 
 # In-memory job store
 jobs: dict[str, dict] = {}
-# WebSocket connections per job_id for pushing real-time events
-WS_CONNECTIONS: dict[str, list[WebSocket]] = {}
+# WebSocket transport for pushing real-time job and artifact events
+job_transport = JobWebSocketTransport()
+RECOVERY_REPORT: dict = {}
 
 # ---------------------------------------------------------------------------
 # Persistence helpers
@@ -198,10 +218,14 @@ def init_db() -> None:
             conn.execute("ALTER TABLE artifacts ADD COLUMN generation_error TEXT;")
         except Exception:
             pass
-        conn.execute(
-            "UPDATE jobs SET status = 'error', error = 'Server restarted while job was pending.', updated_at = ? WHERE status IN ('queued', 'running');",
-            (_current_timestamp(),),
-        )
+        try:
+            conn.execute("ALTER TABLE artifacts ADD COLUMN generation_started_at TEXT;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE artifacts ADD COLUMN generation_completed_at TEXT;")
+        except Exception:
+            pass
         conn.commit()
         conn.close()
     # ensure runtime events table exists
@@ -209,6 +233,41 @@ def init_db() -> None:
         runtime_events.init_runtime_events_table()
     except Exception:
         pass
+
+    global RECOVERY_REPORT
+    try:
+        recovery_ts = _current_timestamp()
+        with DB_LOCK, get_db_connection() as conn:
+            orphaned_rows = conn.execute(
+                "SELECT job_id, status FROM jobs WHERE status IN ('queued', 'running');"
+            ).fetchall()
+            stale_artifact_rows = conn.execute(
+                "SELECT artifact_id, job_id, generation_status FROM artifacts WHERE generation_status = 'running';"
+            ).fetchall()
+            for row in orphaned_rows:
+                transition_state(
+                    entity_type=ENTITY_JOB,
+                    entity_id=row['job_id'],
+                    current_state=row['status'],
+                    next_state='error',
+                    reason='server restarted while job was pending',
+                    source='startup_recovery',
+                    actor='runtime',
+                )
+            conn.execute(
+                "UPDATE jobs SET status = 'error', error = 'Server restarted while job was pending.', updated_at = ? WHERE status IN ('queued', 'running');",
+                (recovery_ts,),
+            )
+            conn.commit()
+            RECOVERY_REPORT = {
+                "timestamp": recovery_ts,
+                "orphaned_jobs": [dict(row) for row in orphaned_rows],
+                "stale_artifacts": [dict(row) for row in stale_artifact_rows],
+                "actions": ["marked queued/running jobs as error"],
+                "replayed_state_count": len(runtime_recovery.replay_runtime_state(runtime_events.fetch_events(limit=1000))),
+            }
+    except Exception as exc:
+        RECOVERY_REPORT = {"error": str(exc)}
 
 
 def _upsert_search_index(conn: sqlite3.Connection, job: dict) -> None:
@@ -334,6 +393,20 @@ def create_db_job(job: dict) -> None:
             'transcript_text': None,
         })
         conn.commit()
+    transition_state(
+        entity_type=ENTITY_JOB,
+        entity_id=job['id'],
+        current_state=None,
+        next_state=job.get('status') or 'queued',
+        reason='job created',
+        source='api',
+        actor='runtime',
+        payload={
+            'source_type': job.get('source_type'),
+            'model': job.get('model'),
+            'language': job.get('language'),
+        },
+    )
 
 
 def update_db_job(job_id: str, updates: dict) -> None:
@@ -507,10 +580,20 @@ def create_artifact_record(job_id: str, artifact_type: str, title: str | None, c
             ),
         )
         conn.commit()
+    transition_state(
+        entity_type=ENTITY_ARTIFACT,
+        entity_id=artifact_id,
+        current_state=None,
+        next_state=generation_status,
+        reason='artifact created',
+        source='api',
+        actor='runtime',
+        payload={'job_id': job_id, 'artifact_type': artifact_type},
+    )
     return artifact_id
 
 
-def record_artifact_event(artifact_id: str, job_id: str, event_type: str, status: str, detail: dict | None = None) -> None:
+def record_artifact_event(artifact_id: str, job_id: str, event_type: str, status: str, detail: dict | None = None) -> dict | None:
     event_id = str(uuid.uuid4())
     ts = _current_timestamp()
     with DB_LOCK, get_db_connection() as conn:
@@ -521,45 +604,54 @@ def record_artifact_event(artifact_id: str, job_id: str, event_type: str, status
         conn.commit()
     # emit a canonical runtime event as well
     try:
-        runtime_events.emit_event({
-            'job_id': job_id,
-            'artifact_id': artifact_id,
-            'entity_type': 'artifact',
-            'event_type': event_type,
-            'source': 'artifact_projection',
-            'state_from': None,
-            'state_to': status,
-            'correlation_id': None,
-            'causation_id': None,
-            'payload': detail or {},
-        })
+        return runtime_events.emit_event(create_event(
+            job_id=job_id,
+            artifact_id=artifact_id,
+            entity_type=ENTITY_ARTIFACT,
+            entity_id=artifact_id,
+            event_type=event_type,
+            event_category=EVENT_CATEGORY_ARTIFACT,
+            source='artifact_projection',
+            state_to=status,
+            payload=detail or {},
+        ))
     except Exception:
         pass
+    return None
 
 
 async def broadcast_to_job(job_id: str, message: dict) -> None:
     """Send a JSON message to all connected websockets for a job."""
-    conns = WS_CONNECTIONS.get(job_id, [])
-    if not conns:
-        return
-    to_remove: list[WebSocket] = []
-    for ws in list(conns):
-        try:
-            await ws.send_json(message)
-        except Exception:
-            to_remove.append(ws)
-    # cleanup closed sockets
-    if to_remove:
-        WS_CONNECTIONS[job_id] = [w for w in conns if w not in to_remove]
+    event = runtime_events.emit_event(websocket_event(job_id, message))
+    await job_transport.broadcast(job_id, legacy_websocket_message(event, message))
 
 
 def update_artifact_record(artifact_id: str, updates: dict) -> None:
+    if not updates:
+        return
+    updates = dict(updates)
+    transition_reason = updates.pop('_transition_reason', 'artifact status update')
+    transition_source = updates.pop('_transition_source', 'runtime')
+    transition_actor = updates.pop('_transition_actor', 'runtime')
     if not updates:
         return
     updates['updated_at'] = _current_timestamp()
     keys = ', '.join([f"{k} = ?" for k in updates.keys()])
     params = list(updates.values()) + [artifact_id]
     with DB_LOCK, get_db_connection() as conn:
+        if 'generation_status' in updates:
+            row = conn.execute("SELECT artifact_id, job_id, generation_status FROM artifacts WHERE artifact_id = ?;", (artifact_id,)).fetchone()
+            if row:
+                transition_state(
+                    entity_type=ENTITY_ARTIFACT,
+                    entity_id=artifact_id,
+                    current_state=row['generation_status'],
+                    next_state=updates['generation_status'],
+                    reason=transition_reason,
+                    source=transition_source,
+                    actor=transition_actor,
+                    payload={'job_id': row['job_id']},
+                )
         conn.execute(f"UPDATE artifacts SET {keys} WHERE artifact_id = ?;", params)
         conn.commit()
 
@@ -610,7 +702,7 @@ async def resume_queued_artifacts():
             rec = dict(r)
             try:
                 logging.info(f"Resuming artifact {rec['artifact_id']} (status={rec['generation_status']})")
-                asyncio.create_task(generate_artifact_job(rec['artifact_id'], rec['job_id'], rec['artifact_type'], None))
+                enqueue_background_task(generate_artifact_job(rec['artifact_id'], rec['job_id'], rec['artifact_type'], None))
             except Exception:
                 logging.exception(f"Failed to resume artifact {rec['artifact_id']}")
 
@@ -666,6 +758,28 @@ def list_available_models() -> list[str]:
 
 
 def update_job(job_id: str, **kwargs):
+    transition_reason = kwargs.pop('_transition_reason', 'job status update')
+    transition_source = kwargs.pop('_transition_source', 'runtime')
+    transition_actor = kwargs.pop('_transition_actor', 'runtime')
+    if 'status' in kwargs:
+        current_state = None
+        if job_id in jobs:
+            current_state = jobs[job_id].get('status')
+        else:
+            saved = fetch_db_job(job_id)
+            if saved:
+                current_state = saved.get('status')
+        transition_state(
+            entity_type=ENTITY_JOB,
+            entity_id=job_id,
+            current_state=current_state,
+            next_state=kwargs['status'],
+            reason=transition_reason,
+            source=transition_source,
+            actor=transition_actor,
+            payload={'updated_fields': sorted(kwargs.keys())},
+        )
+
     if job_id in jobs:
         jobs[job_id].update(kwargs)
 
@@ -689,7 +803,7 @@ async def run_postprocessing_pipeline(job_id: str, defaults: list[str] | None = 
     Creates artifact records (if missing) and schedules background generation tasks.
     """
     logging.info(f"Postprocessing pipeline start for job {job_id}")
-    defaults = defaults or ['summary', 'chapter_map']
+    defaults = default_artifact_types(defaults)
     job = fetch_db_job(job_id)
     if not job:
         logging.warning(f"Postprocessing: job {job_id} not found")
@@ -702,7 +816,7 @@ async def run_postprocessing_pipeline(job_id: str, defaults: list[str] | None = 
         artifact_id = create_artifact_record(job_id, art_type, title, '', {'source_transcript_hash': transcript_hash}, generation_model=None, generation_status='queued')
         logging.info(f"Created artifact {artifact_id} ({art_type}) for job {job_id}")
         # schedule generation
-        asyncio.create_task(generate_artifact_job(artifact_id, job_id, art_type, None))
+        enqueue_background_task(generate_artifact_job(artifact_id, job_id, art_type, None))
 
     logging.info(f"Postprocessing pipeline scheduled for job {job_id}")
 
@@ -930,7 +1044,7 @@ async def run_transcription_job(job_id: str, url: Optional[str], file_path: Opti
         )
         # kick off autonomous postprocessing pipeline (summary, chapter_map)
         try:
-            asyncio.create_task(run_postprocessing_pipeline(job_id))
+            enqueue_background_task(run_postprocessing_pipeline(job_id))
         except Exception as e:
             logging.exception(f"Failed to start postprocessing for {job_id}: {e}")
 
@@ -1027,23 +1141,17 @@ async def transcribe_url(
     """Start a transcription job from a URL. Returns job_id immediately."""
     job_id = str(uuid.uuid4())
     created_at = _current_timestamp()
-    jobs[job_id] = {
-        "id": job_id,
-        "status": "queued",
-        "step": "yt-dlp",
-        "step_status": "pending",
-        "progress": 0,
-        "source_type": "url",
-        "source": url,
-        "model": model,
-        "language": language,
-        "created_at": created_at,
-        "updated_at": created_at,
-        "transcript": None,
-        "error": None,
-    }
+    jobs[job_id] = create_queued_job(
+        job_id,
+        source_type="url",
+        source=url,
+        model=model,
+        language=language,
+        created_at=created_at,
+        step="yt-dlp",
+    )
     create_db_job(jobs[job_id])
-    asyncio.create_task(run_transcription_job(job_id, url, None, model, language))
+    enqueue_background_task(run_transcription_job(job_id, url, None, model, language))
     return {"job_id": job_id}
 
 
@@ -1065,24 +1173,18 @@ async def transcribe_file(
         f.write(content)
 
     created_at = _current_timestamp()
-    jobs[job_id] = {
-        "id": job_id,
-        "status": "queued",
-        "step": "ffmpeg",
-        "step_status": "pending",
-        "progress": 0,
-        "source_type": "file",
-        "source": file.filename,
-        "filename": file.filename,
-        "model": model,
-        "language": language,
-        "created_at": created_at,
-        "updated_at": created_at,
-        "transcript": None,
-        "error": None,
-    }
+    jobs[job_id] = create_queued_job(
+        job_id,
+        source_type="file",
+        source=file.filename,
+        filename=file.filename,
+        model=model,
+        language=language,
+        created_at=created_at,
+        step="ffmpeg",
+    )
     create_db_job(jobs[job_id])
-    asyncio.create_task(run_transcription_job(job_id, None, upload_path, model, language))
+    enqueue_background_task(run_transcription_job(job_id, None, upload_path, model, language))
     return {"job_id": job_id}
 
 
@@ -1114,6 +1216,38 @@ async def api_runtime_events(job_id: Optional[str] = None, limit: int = 200):
     """Fetch canonical runtime events (append-only)."""
     rows = runtime_events.fetch_events(job_id=job_id, limit=limit)
     return {"events": rows}
+
+
+@app.get("/api/runtime/status")
+async def api_runtime_status():
+    """Runtime execution and recovery status."""
+    queue = runtime_queue_snapshot()
+    return {
+        "status": "ok",
+        "queue_depth": queue.get("queue_depth", 0),
+        "active_tasks": queue.get("active_tasks", []),
+        "active_count": queue.get("active_count", 0),
+        "recent_failures": queue.get("recent_failures", []),
+        "recovery": RECOVERY_REPORT,
+    }
+
+
+@app.get("/api/runtime/queues")
+async def api_runtime_queues():
+    """Inspect scheduler queue and active task state."""
+    return runtime_queue_snapshot()
+
+
+@app.get("/api/runtime/events/recent")
+async def api_runtime_events_recent(limit: int = 100):
+    """Fetch recent canonical runtime events."""
+    return {"events": runtime_events.fetch_events(limit=limit)}
+
+
+@app.get("/api/runtime/entity/{entity_id}/timeline")
+async def api_runtime_entity_timeline(entity_id: str, limit: int = 200):
+    """Fetch canonical timeline for a job or artifact entity."""
+    return {"events": runtime_events.fetch_entity_timeline(entity_id, limit=limit)}
 
 
 @app.get("/api/artifact/{artifact_id}/events")
@@ -1168,85 +1302,35 @@ async def generate_artifact_job(artifact_id: str, job_id: str, artifact_type: st
             rows = conn.execute("SELECT chunk_index, start_ts, end_ts, text FROM chunks WHERE job_id = ? ORDER BY chunk_index ASC LIMIT 20;", (job_id,)).fetchall()
             chunks_rows = [dict(r) for r in rows]
 
-        if artifact_type == 'summary':
-            if chunks_rows:
-                # simulate progress
-                await broadcast_to_job(job_id, {'type': 'artifact_update','artifact_id': artifact_id,'artifact_type': artifact_type,'status': 'running','progress': 40})
-                record_artifact_event(artifact_id, job_id, 'artifact_progress', '40', {'note': 'assembling summary from chunks'})
-                summary = '\n\n'.join([c['text'] for c in chunks_rows[:3]])
-            else:
-                summary = (transcript.get('text') or '')[:1600]
-            content = summary.strip()
-            metadata = {'method': 'heuristic', 'source': 'chunks' if chunks_rows else 'transcript'}
+        async def emit_artifact_progress(progress: int, note: str) -> None:
+            await broadcast_to_job(job_id, {
+                'type': 'artifact_update',
+                'artifact_id': artifact_id,
+                'artifact_type': artifact_type,
+                'status': 'running',
+                'progress': progress,
+            })
+            record_artifact_event(artifact_id, job_id, 'artifact_progress', str(progress), {'note': note})
 
-        elif artifact_type == 'chapter_map':
-            chapters = []
-            if chunks_rows:
-                # simulate progress
-                await broadcast_to_job(job_id, {'type': 'artifact_update','artifact_id': artifact_id,'artifact_type': artifact_type,'status': 'running','progress': 35})
-                record_artifact_event(artifact_id, job_id, 'artifact_progress', '35', {'note': 'clustering chunks for chapters'})
-                # group by every ~5 chunks as simple chapter heuristic
-                chunk_group = 5
-                for i in range(0, len(chunks_rows), chunk_group):
-                    group = chunks_rows[i:i+chunk_group]
-                    title = group[0]['text'][:80].strip()
-                    start = group[0].get('start_ts')
-                    end = group[-1].get('end_ts')
-                    chapters.append({'title': title, 'start_ts': start, 'end_ts': end})
-            content = json.dumps({'chapters': chapters}, ensure_ascii=False)
-            metadata = {'method': 'chunk_grouping', 'group_size': 5}
-
-        elif artifact_type == 'entities':
-            text = '\n'.join([c['text'] for c in chunks_rows]) if chunks_rows else (transcript.get('text') or '')
-            await broadcast_to_job(job_id, {'type': 'artifact_update','artifact_id': artifact_id,'artifact_type': artifact_type,'status': 'running','progress': 30})
-            record_artifact_event(artifact_id, job_id, 'artifact_progress', '30', {'note': 'scanning for entities'})
-            # naive entity extraction: capitalized words frequency
-            import re
-            words = re.findall(r"\b([A-Z][a-z]{2,})\b", text)
-            freq = {}
-            for w in words:
-                freq[w] = freq.get(w, 0) + 1
-            entities = sorted([{'entity': k, 'count': v} for k, v in freq.items()], key=lambda x: -x['count'])[:60]
-            content = json.dumps({'entities': entities}, ensure_ascii=False)
-            metadata = {'method': 'heuristic-capitalized-words'}
-
-        elif artifact_type == 'topics':
-            text = '\n'.join([c['text'] for c in chunks_rows]) if chunks_rows else (transcript.get('text') or '')
-            await broadcast_to_job(job_id, {'type': 'artifact_update','artifact_id': artifact_id,'artifact_type': artifact_type,'status': 'running','progress': 30})
-            record_artifact_event(artifact_id, job_id, 'artifact_progress', '30', {'note': 'extracting topic words'})
-            # naive topic extraction: top words excluding stopwords
-            stop = set(['the','and','for','with','that','this','have','from','are','was','were','what','which','when','where','you','your','will','shall','but','not','can','have','has'])
-            import re
-            words = [w.lower() for w in re.findall(r"\b([A-Za-z]{3,})\b", text)]
-            freq = {}
-            for w in words:
-                if w in stop: continue
-                freq[w] = freq.get(w, 0) + 1
-            topics = sorted([{'topic': k, 'count': v} for k, v in freq.items()], key=lambda x: -x['count'])[:40]
-            content = json.dumps({'topics': topics}, ensure_ascii=False)
-            metadata = {'method': 'heuristic-top-words'}
-
-        elif artifact_type == 'quotes':
-            text = '\n'.join([c['text'] for c in chunks_rows]) if chunks_rows else (transcript.get('text') or '')
-            await broadcast_to_job(job_id, {'type': 'artifact_update','artifact_id': artifact_id,'artifact_type': artifact_type,'status': 'running','progress': 30})
-            record_artifact_event(artifact_id, job_id, 'artifact_progress', '30', {'note': 'finding quotes'})
-            import re
-            quotes = re.findall(r'"([^"]{20,200})"', text)
-            quotes = quotes[:80]
-            content = json.dumps({'quotes': quotes}, ensure_ascii=False)
-            metadata = {'method': 'heuristic-quote-extract'}
-
-        else:
-            content = f"Unsupported artifact type: {artifact_type}"
-            metadata = {'method': 'none'}
+        content, metadata = await generate_artifact_content(
+            artifact_type,
+            transcript,
+            chunks_rows,
+            emit_artifact_progress,
+        )
 
         # persist (simulate finalizing)
+        update_artifact_record(artifact_id, {
+            'generation_status': 'persisting',
+            '_transition_reason': 'persisting artifact content',
+            '_transition_source': 'artifact_generator',
+        })
         await broadcast_to_job(job_id, {'type': 'artifact_update','artifact_id': artifact_id,'artifact_type': artifact_type,'status': 'persisting','progress': 90})
         record_artifact_event(artifact_id, job_id, 'artifact_progress', '90', {'note': 'persisting artifact'})
         start_ts = datetime.utcnow()
         persist_artifact_content(job_id, artifact_id, content, metadata)
         # update artifact record and add a version
-        update_artifact_record(artifact_id, {'generation_status': 'done', 'content': content, 'metadata_json': json.dumps(metadata), 'generation_completed_at': _current_timestamp()})
+        update_artifact_record(artifact_id, {'generation_status': 'done', 'content': content, 'metadata_json': json.dumps(metadata), 'generation_completed_at': _current_timestamp(), '_transition_reason': 'artifact generation completed', '_transition_source': 'artifact_generator'})
         duration_ms = int((datetime.utcnow() - start_ts).total_seconds() * 1000)
         with DB_LOCK, get_db_connection() as conn:
             conn.execute("INSERT INTO artifact_versions (artifact_id, version_number, content, metadata_json, created_at) VALUES (?, ?, ?, ?, ?);", (artifact_id, 1, content, json.dumps(metadata), _current_timestamp()))
@@ -1272,7 +1356,7 @@ async def api_generate_artifact(job_id: str, artifact_type: str, generation_mode
     title = f"{artifact_type} for {job_id}" 
     artifact_id = create_artifact_record(job_id, artifact_type, title, '', None, generation_model, generation_status='queued')
     # start background task
-    asyncio.create_task(generate_artifact_job(artifact_id, job_id, artifact_type, generation_model))
+    enqueue_background_task(generate_artifact_job(artifact_id, job_id, artifact_type, generation_model))
     return {"artifact_id": artifact_id}
 
 
@@ -1320,8 +1404,7 @@ async def job_progress_ws(websocket: WebSocket, job_id: str):
     Closes automatically when job is done or errors.
     """
     await websocket.accept()
-    # register websocket
-    WS_CONNECTIONS.setdefault(job_id, []).append(websocket)
+    job_transport.register(job_id, websocket)
     try:
         while True:
             if job_id not in jobs:
@@ -1329,17 +1412,9 @@ async def job_progress_ws(websocket: WebSocket, job_id: str):
                 break
 
             job = jobs[job_id]
-            await websocket.send_json({
-                "id": job["id"],
-                "status": job["status"],
-                "step": job.get("step"),
-                "step_status": job.get("step_status"),
-                "progress": job.get("progress", 0),
-                "error": job.get("error"),
-                "transcript": job.get("transcript") if job["status"] == "done" else None,
-            })
+            await websocket.send_json(build_job_snapshot(job))
 
-            if job["status"] in ("done", "error"):
+            if job["status"] in JOB_TERMINAL_STATUSES:
                 break
 
             await asyncio.sleep(0.5)
@@ -1349,7 +1424,7 @@ async def job_progress_ws(websocket: WebSocket, job_id: str):
     finally:
         # remove websocket from registry
         try:
-            WS_CONNECTIONS[job_id] = [w for w in WS_CONNECTIONS.get(job_id, []) if w is not websocket]
+            job_transport.unregister(job_id, websocket)
         except Exception:
             pass
         try:
