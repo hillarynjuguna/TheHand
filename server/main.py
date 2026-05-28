@@ -84,7 +84,7 @@ FRONTEND_DIR = os.environ.get(
     str(Path(__file__).parent / "dist"),
 )
 
-TEMP_DIR = Path(tempfile.gettempdir()) / "thehand"
+TEMP_DIR = Path(os.environ.get("THEHAND_TEMP_DIR", str(Path.home() / ".thehand" / "tmp")))
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 # Persistent storage and artifacts
