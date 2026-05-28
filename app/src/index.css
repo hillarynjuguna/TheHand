@@ -39,6 +39,7 @@
     font-family: 'Inter', sans-serif;
     background-color: #F5F0E8;
     color: #1A1A1A;
+    min-width: 320px;
   }
 
   h1, h2, h3, h4, h5, h6 {
@@ -47,5 +48,82 @@
 
   code, pre, .font-mono {
     font-family: 'JetBrains Mono', monospace;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  *:focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: 3px;
+  }
+
+  html {
+    scroll-behavior: smooth;
+    text-rendering: geometricPrecision;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      scroll-behavior: auto !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer components {
+  .workspace-shell {
+    @apply mx-auto w-full max-w-7xl px-4 sm:px-6 lg:px-8;
+  }
+
+  .workspace-panel {
+    @apply rounded-[1.75rem] border border-black/10 bg-white shadow-[0_24px_80px_rgba(26,26,26,0.06)];
+  }
+
+  .workspace-panel-muted {
+    @apply rounded-[1.75rem] border border-black/10 bg-[#F8F6F2];
+  }
+
+  .workspace-label {
+    @apply font-mono text-[0.68rem] font-semibold uppercase tracking-[0.18em] text-[#8B563B];
+  }
+
+  .workspace-title {
+    @apply font-heading text-3xl font-semibold leading-tight tracking-[-0.03em] text-[#171614] sm:text-4xl lg:text-5xl;
+  }
+
+  .workspace-copy {
+    @apply text-base leading-7 text-[#5F5A54] sm:text-lg;
+  }
+
+  .control-surface {
+    @apply min-h-12 rounded-2xl border border-black/10 bg-white px-4 text-base text-[#171614] shadow-[inset_0_1px_0_rgba(255,255,255,0.8)] transition duration-200 placeholder:text-[#928A82] focus:border-[#8B563B] focus:ring-4 focus:ring-[#C17F59]/15;
+  }
+
+  .primary-action {
+    @apply inline-flex min-h-12 items-center justify-center rounded-2xl bg-[#171614] px-5 text-sm font-semibold text-[#F8F6F2] transition duration-200 hover:bg-[#8B563B] active:scale-[0.99] disabled:cursor-not-allowed disabled:bg-[#7A746D];
+  }
+
+  .secondary-action {
+    @apply inline-flex min-h-11 items-center justify-center rounded-2xl border border-black/10 bg-white px-4 text-sm font-semibold text-[#27231F] transition duration-200 hover:border-[#8B563B]/40 hover:bg-[#F8F6F2] active:scale-[0.99];
+  }
+
+  .status-pill {
+    @apply inline-flex items-center gap-2 rounded-full border px-3 py-1.5 font-mono text-[0.68rem] font-semibold uppercase tracking-[0.12em];
+  }
+
+  .runtime-dot {
+    @apply h-2.5 w-2.5 rounded-full ring-4;
+  }
+
+  .safe-bottom {
+    padding-bottom: calc(env(safe-area-inset-bottom) + 1rem);
   }
 }
