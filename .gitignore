@@ -5,3 +5,4 @@ __pycache__/
 app/dist/
 server/data/
 server/tmp/
+server/*.log
