@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import type { ReactNode } from 'react';
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:8080';
@@ -99,6 +99,9 @@ export default function Library({ refreshKey }: LibraryProps) {
   const [detailLoading, setDetailLoading] = useState(false);
   const [artifacts, setArtifacts] = useState<any[]>([]);
   const [selectedArtifact, setSelectedArtifact] = useState<any | null>(null);
+  const [artifactEvents, setArtifactEvents] = useState<any[]>([]);
+  const wsRef = useRef<WebSocket | null>(null);
+ 
   const [error, setError] = useState('');
 
   useEffect(() => {
@@ -197,6 +200,46 @@ export default function Library({ refreshKey }: LibraryProps) {
       setArtifacts([]);
     }
   }
+
+  useEffect(() => {
+    // open websocket to receive job + artifact events when a job is selected
+    if (!selectedJob) {
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+      return;
+    }
+
+    const wsUrl = `${API_BASE.replace(/^http/, 'ws')}/ws/job/${selectedJob.job_id}`;
+    const ws = new WebSocket(wsUrl);
+    wsRef.current = ws;
+    ws.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data as string);
+        if (msg.type === 'artifact_update' || msg.type === 'artifact_progress' || msg.type === 'artifact_complete') {
+          setArtifactEvents((s) => [...s, msg]);
+          // update artifact status in list if present
+          setArtifacts((prev) => prev.map((a) => (a.artifact_id === msg.artifact_id ? { ...a, generation_status: msg.status } : a)));
+          if (msg.type === 'artifact_complete') {
+            // refresh artifacts to pick up persisted content
+            setTimeout(() => fetchArtifacts(selectedJob.job_id), 400);
+          }
+        } else if (msg.status) {
+          // job heartbeat — ignore for artifact timeline but could be used
+        }
+      } catch (e) {
+        // ignore parse errors
+      }
+    };
+    ws.onopen = () => {};
+    ws.onclose = () => {};
+
+    return () => {
+      try { ws.close(); } catch {}
+      wsRef.current = null;
+    };
+  }, [selectedJob]);
 
   async function viewArtifact(a: any) {
     try {
@@ -580,9 +623,23 @@ export default function Library({ refreshKey }: LibraryProps) {
                     {selectedArtifact && (
                       <div className="mt-4 p-4 rounded-lg border bg-[#F8F6F2]" style={{ borderColor: 'rgba(26,26,26,0.06)' }}>
                         <div className="mb-2 font-semibold">{selectedArtifact.artifact_type} — {selectedArtifact.title}</div>
-                        <pre className="whitespace-pre-wrap text-sm" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
-                          {selectedArtifact.persisted ? JSON.stringify(selectedArtifact.persisted, null, 2) : (selectedArtifact.content || 'No content yet.')}
-                        </pre>
+                          <div className="mb-3 text-xs text-[#6B6560]">Artifact timeline</div>
+                          <div className="mb-3 max-h-40 overflow-auto text-sm bg-white p-2 rounded">
+                            {artifactEvents.filter(ev => ev.artifact_id === selectedArtifact.artifact_id).length === 0 ? (
+                              <div className="text-xs text-[#6B6560]">No events yet.</div>
+                            ) : (
+                              artifactEvents.filter(ev => ev.artifact_id === selectedArtifact.artifact_id).map((ev, idx) => (
+                                <div key={idx} className="text-xs py-1" style={{ color: '#4B4B4B' }}>
+                                  <div className="font-mono text-[11px] text-[#6B6560]">{ev.timestamp ?? ''}</div>
+                                  <div>{ev.type || ev.event_type} — {String(ev.status)}</div>
+                                  {ev.detail && <div className="text-[#6B6560] text-[12px]">{JSON.stringify(ev.detail)}</div>}
+                                </div>
+                              ))
+                            )}
+                          </div>
+                          <pre className="whitespace-pre-wrap text-sm" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
+                            {selectedArtifact.persisted ? JSON.stringify(selectedArtifact.persisted, null, 2) : (selectedArtifact.content || 'No content yet.')}
+                          </pre>
                       </div>
                     )}
                   </div>
