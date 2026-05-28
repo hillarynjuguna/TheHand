@@ -28,11 +28,11 @@ from typing import Optional
 import hashlib
 import logging
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, BackgroundTasks
+from fastapi import FastAPI
 
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
 from api.routes.frontend import register_frontend_routes
+from api.routes.runtime import RuntimeRouteDeps, create_runtime_router
 from api.websocket.jobs import register_job_websocket_routes
 from runtime import events as runtime_events
 from runtime import store as runtime_store
@@ -52,9 +52,11 @@ from runtime.schema import (
     websocket_event,
 )
 from runtime.state import create_queued_job
+from runtime.state import JOB_TERMINAL_STATUSES
 from runtime.state_machine import transition_state
 from runtime.transport import JobWebSocketTransport
 from runtime import recovery as runtime_recovery
+from runtime.jobs.registry import SQLiteJobRegistry
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -93,8 +95,7 @@ transcript_artifact_store = TranscriptArtifactStore(runtime_store.JOB_ARTIFACTS_
 DATA_DIR = runtime_store.DATA_DIR
 FTS_ENABLED = False
 
-# In-memory job store
-jobs: dict[str, dict] = {}
+job_registry = SQLiteJobRegistry()
 # WebSocket transport for pushing real-time job and artifact events
 job_transport = JobWebSocketTransport()
 RECOVERY_REPORT: dict = {}
@@ -269,7 +270,6 @@ app = FastAPI(title="TheHand Transcription Server", version="1.0.0")
 init_db()
 
 
-@app.on_event("startup")
 async def resume_queued_artifacts():
     """On startup, resume artifact generation for queued or running artifacts."""
     logging.info("Startup: scanning for queued artifacts to resume")
@@ -286,6 +286,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.router.add_event_handler("startup", resume_queued_artifacts)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -309,8 +311,9 @@ def update_job(job_id: str, **kwargs):
     transition_actor = kwargs.pop('_transition_actor', 'runtime')
     if 'status' in kwargs:
         current_state = None
-        if job_id in jobs:
-            current_state = jobs[job_id].get('status')
+        active = job_registry.get_active_snapshot(job_id)
+        if active:
+            current_state = active.get('status')
         else:
             saved = fetch_db_job(job_id)
             if saved:
@@ -326,8 +329,9 @@ def update_job(job_id: str, **kwargs):
             payload={'updated_fields': sorted(kwargs.keys())},
         )
 
-    if job_id in jobs:
-        jobs[job_id].update(kwargs)
+    updated_snapshot = job_registry.update_job(job_id, kwargs)
+    if kwargs.get("status") in JOB_TERMINAL_STATUSES and updated_snapshot:
+        job_registry.mark_terminal(job_id)
 
     db_updates: dict[str, object] = {}
     for key, value in kwargs.items():
@@ -462,92 +466,14 @@ async def run_transcription_job(job_id: str, url: Optional[str], file_path: Opti
 
 
 # ---------------------------------------------------------------------------
-# API Routes
+# API adapter service functions
 # ---------------------------------------------------------------------------
 
-@app.get("/api/health")
-async def health():
-    """Health check — also validates whisper and model availability."""
-    try:
-        whisper_ok = bool(get_whisper_bin())
-    except FileNotFoundError:
-        whisper_ok = False
 
-    return {
-        "status": "ok",
-        "whisper_ready": whisper_ok,
-        "whisper_bin": WHISPER_BIN,
-        "models_dir": MODELS_DIR,
-        "available_models": list_available_models(),
-    }
-
-
-@app.get("/api/jobs")
-async def list_jobs(
-    q: Optional[str] = None,
-    status: Optional[str] = None,
-    source_type: Optional[str] = None,
-    model: Optional[str] = None,
-    limit: int = 50,
-    offset: int = 0,
-):
-    """List saved jobs and search transcripts."""
-    jobs = list_db_jobs(search=q, status=status, source_type=source_type, model=model, limit=limit, offset=offset)
-    return {"jobs": jobs}
-
-
-@app.get("/api/chunks")
-async def get_chunks(
-    q: Optional[str] = None,
-    job_id: Optional[str] = None,
-    status: Optional[str] = None,
-    top_k: int = 20,
-    offset: int = 0,
-):
-    """Search transcript chunks and return semantic results."""
-    if q:
-        chunks = search_chunks(q, job_id=job_id, status=status, top_k=top_k)
-    else:
-        rows = list_chunks(job_id=job_id, status=status, top_k=top_k, offset=offset)
-        chunks = [
-            {
-                'chunk_id': row['chunk_id'],
-                'job_id': row['job_id'],
-                'chunk_index': row['chunk_index'],
-                'start_ts': row['start_ts'],
-                'end_ts': row['end_ts'],
-                'text': row['text'],
-                'score': None,
-                'source_type': row['source_type'],
-                'source': row['source'],
-                'filename': row['filename'],
-                'job_status': row['job_status'],
-                'model': row['model'],
-                'language': row['language'],
-                'job_updated_at': row['job_updated_at'],
-            }
-            for row in rows
-        ]
-    return {"chunks": chunks}
-
-
-@app.get("/api/models")
-async def get_models():
-    """List available Whisper models."""
-    return {"models": list_available_models()}
-
-
-@app.post("/api/transcribe/url")
-async def transcribe_url(
-    background_tasks: BackgroundTasks,
-    url: str = Form(...),
-    model: str = Form("small"),
-    language: str = Form("auto"),
-):
-    """Start a transcription job from a URL. Returns job_id immediately."""
+def start_url_transcription(url: str, model: str, language: str) -> dict:
     job_id = str(uuid.uuid4())
     created_at = _current_timestamp()
-    jobs[job_id] = create_queued_job(
+    job = create_queued_job(
         job_id,
         source_type="url",
         source=url,
@@ -556,212 +482,64 @@ async def transcribe_url(
         created_at=created_at,
         step="yt-dlp",
     )
-    create_db_job(jobs[job_id])
+    job_registry.create_job(job)
+    create_db_job(job)
     enqueue_background_task(run_transcription_job(job_id, url, None, model, language))
     return {"job_id": job_id}
 
 
-@app.post("/api/transcribe/file")
-async def transcribe_file(
-    file: UploadFile = File(...),
-    model: str = Form("small"),
-    language: str = Form("auto"),
-):
-    """Start a transcription job from an uploaded file."""
+def start_file_transcription(filename: str | None, content: bytes, model: str, language: str) -> dict:
     job_id = str(uuid.uuid4())
     job_dir = TEMP_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    suffix = Path(file.filename or "audio").suffix or ".audio"
+    suffix = Path(filename or "audio").suffix or ".audio"
     upload_path = job_dir / f"upload{suffix}"
-    with open(upload_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
+    upload_path.write_bytes(content)
 
     created_at = _current_timestamp()
-    jobs[job_id] = create_queued_job(
+    job = create_queued_job(
         job_id,
         source_type="file",
-        source=file.filename,
-        filename=file.filename,
+        source=filename,
+        filename=filename,
         model=model,
         language=language,
         created_at=created_at,
         step="ffmpeg",
     )
-    create_db_job(jobs[job_id])
+    job_registry.create_job(job)
+    create_db_job(job)
     enqueue_background_task(run_transcription_job(job_id, None, upload_path, model, language))
     return {"job_id": job_id}
 
 
-@app.get("/api/job/{job_id}")
-async def get_job_status(job_id: str):
-    """Poll job status and retrieve transcript when done."""
-    if job_id in jobs:
-        return jobs[job_id]
-
-    saved = fetch_db_job(job_id)
-    if not saved:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return saved
+def get_job_for_api(job_id: str) -> dict | None:
+    return job_registry.get_active_snapshot(job_id) or fetch_db_job(job_id)
 
 
-@app.get("/api/job/{job_id}/artifacts")
-async def api_list_job_artifacts(job_id: str):
-    """List artifacts derived from a job."""
-    # validate job exists
-    saved = fetch_db_job(job_id)
-    if not saved:
-        raise HTTPException(status_code=404, detail="Job not found")
-    arts = list_job_artifacts(job_id)
-    return {"artifacts": arts}
+def get_artifact_for_api(artifact_id: str) -> dict | None:
+    artifact = fetch_artifact_record(artifact_id)
+    if not artifact:
+        return None
+    job_id = artifact.get('job_id')
+    artifact['persisted'] = artifacts_repo.load_persisted_artifact(job_id, artifact_id)
+    return artifact
 
 
-@app.get("/api/runtime/events")
-async def api_runtime_events(job_id: Optional[str] = None, limit: int = 200):
-    """Fetch canonical runtime events (append-only)."""
-    rows = runtime_events.fetch_events(job_id=job_id, limit=limit)
-    return {"events": rows}
-
-
-@app.get("/api/runtime/status")
-async def api_runtime_status():
-    """Runtime execution and recovery status."""
-    queue = runtime_queue_snapshot()
-    return {
-        "status": "ok",
-        "queue_depth": queue.get("queue_depth", 0),
-        "active_tasks": queue.get("active_tasks", []),
-        "active_count": queue.get("active_count", 0),
-        "recent_failures": queue.get("recent_failures", []),
-        "recovery": RECOVERY_REPORT,
-    }
-
-
-@app.get("/api/runtime/queues")
-async def api_runtime_queues():
-    """Inspect scheduler queue and active task state."""
-    return runtime_queue_snapshot()
-
-
-@app.get("/api/runtime/events/recent")
-async def api_runtime_events_recent(limit: int = 100):
-    """Fetch recent canonical runtime events."""
-    return {"events": runtime_events.fetch_events(limit=limit)}
-
-
-@app.get("/api/runtime/entity/{entity_id}/timeline")
-async def api_runtime_entity_timeline(entity_id: str, limit: int = 200):
-    """Fetch canonical timeline for a job or artifact entity."""
-    return {"events": runtime_events.fetch_entity_timeline(entity_id, limit=limit)}
-
-
-@app.get("/api/artifact/{artifact_id}/events")
-async def api_artifact_events(artifact_id: str, limit: int = 200):
-    return {"events": artifacts_repo.list_artifact_events(artifact_id, limit)}
-
-
-@app.get("/api/artifact/{artifact_id}")
-async def api_get_artifact(artifact_id: str):
-    rec = fetch_artifact_record(artifact_id)
-    if not rec:
-        raise HTTPException(status_code=404, detail="Artifact not found")
-    # try to load persisted content file
-    job_id = rec.get('job_id')
-    rec['persisted'] = artifacts_repo.load_persisted_artifact(job_id, artifact_id)
-    return rec
-
-
-async def generate_artifact_job(artifact_id: str, job_id: str, artifact_type: str, generation_model: str | None = None):
-    """Background generator — mocked heuristics that produce artifact content and persist it."""
-    try:
-        update_artifact_record(artifact_id, {'generation_status': 'running', 'generation_attempts': 1, 'generation_started_at': _current_timestamp()})
-        # emit queued -> running event
-        record_artifact_event(artifact_id, job_id, 'artifact_update', 'running', {'stage': 'start'})
-        await broadcast_to_job(job_id, {
-            'type': 'artifact_update',
-            'artifact_id': artifact_id,
-            'artifact_type': artifact_type,
-            'status': 'running',
-            'progress': 10,
-        })
-
-        # load transcript and chunks
-        job = fetch_db_job(job_id)
-        if not job:
-            update_artifact_record(artifact_id, {'generation_status': 'error', 'content': ''})
-            return
-
-        transcript = job.get('transcript', {})
-        # naive summary: first N characters or stitched first 3 chunks
-        chunks_rows = artifacts_repo.chunks_for_artifact_generation(job_id, limit=20)
-
-        async def emit_artifact_progress(progress: int, note: str) -> None:
-            await broadcast_to_job(job_id, {
-                'type': 'artifact_update',
-                'artifact_id': artifact_id,
-                'artifact_type': artifact_type,
-                'status': 'running',
-                'progress': progress,
-            })
-            record_artifact_event(artifact_id, job_id, 'artifact_progress', str(progress), {'note': note})
-
-        content, metadata = await generate_artifact_content(
-            artifact_type,
-            transcript,
-            chunks_rows,
-            emit_artifact_progress,
-        )
-
-        # persist (simulate finalizing)
-        update_artifact_record(artifact_id, {
-            'generation_status': 'persisting',
-            '_transition_reason': 'persisting artifact content',
-            '_transition_source': 'artifact_generator',
-        })
-        await broadcast_to_job(job_id, {'type': 'artifact_update','artifact_id': artifact_id,'artifact_type': artifact_type,'status': 'persisting','progress': 90})
-        record_artifact_event(artifact_id, job_id, 'artifact_progress', '90', {'note': 'persisting artifact'})
-        start_ts = datetime.utcnow()
-        persist_artifact_content(job_id, artifact_id, content, metadata)
-        # update artifact record and add a version
-        update_artifact_record(artifact_id, {'generation_status': 'done', 'content': content, 'metadata_json': json.dumps(metadata), 'generation_completed_at': _current_timestamp(), '_transition_reason': 'artifact generation completed', '_transition_source': 'artifact_generator'})
-        duration_ms = int((datetime.utcnow() - start_ts).total_seconds() * 1000)
-        artifacts_repo.add_artifact_version(artifact_id, content, metadata, _current_timestamp())
-        logging.info(f"Artifact {artifact_id} generated in {duration_ms}ms")
-        # broadcast completion
-        record_artifact_event(artifact_id, job_id, 'artifact_complete', 'done', {'duration_ms': duration_ms})
-        await broadcast_to_job(job_id, {'type': 'artifact_complete','artifact_id': artifact_id,'artifact_type': artifact_type,'status': 'done','progress': 100})
-
-    except Exception as exc:
-        update_artifact_record(artifact_id, {'generation_status': 'error', 'generation_error': str(exc), 'content': ''})
-        logging.exception(f"Artifact generation failed for {artifact_id}: {exc}")
-
-
-@app.post("/api/job/{job_id}/generate/{artifact_type}")
-async def api_generate_artifact(job_id: str, artifact_type: str, generation_model: Optional[str] = None):
-    """Trigger generation of an artifact for a job. Returns artifact_id immediately."""
-    saved = fetch_db_job(job_id)
-    if not saved:
-        raise HTTPException(status_code=404, detail="Job not found")
-    # create artifact record
-    title = f"{artifact_type} for {job_id}" 
+def generate_artifact_for_api(job_id: str, artifact_type: str, generation_model: Optional[str] = None) -> str | None:
+    if not fetch_db_job(job_id):
+        return None
+    title = f"{artifact_type} for {job_id}"
     artifact_id = create_artifact_record(job_id, artifact_type, title, '', None, generation_model, generation_status='queued')
-    # start background task
     enqueue_background_task(generate_artifact_job(artifact_id, job_id, artifact_type, generation_model))
-    return {"artifact_id": artifact_id}
+    return artifact_id
 
 
-@app.get("/api/job/{job_id}/download/{fmt}")
-async def download_transcript(job_id: str, fmt: str):
-    """Download transcript in a specific format: text, srt, vtt, json."""
-    if job_id in jobs:
-        job = jobs[job_id]
-    else:
-        job = fetch_db_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="Job not found")
-    if job["status"] != "done":
-        raise HTTPException(status_code=400, detail="Job not complete yet")
+def download_transcript_payload(job_id: str, fmt: str) -> tuple[str, str, str] | None:
+    job = get_job_for_api(job_id)
+    if not job or job.get("status") != "done":
+        return None
 
     transcript = job.get("transcript", {})
     format_map = {
@@ -770,20 +548,36 @@ async def download_transcript(job_id: str, fmt: str):
         "vtt": ("vtt", "transcript.vtt", "text/vtt"),
         "json": ("json_raw", "transcript.json", "application/json"),
     }
-
-    if fmt not in format_map:
-        raise HTTPException(status_code=400, detail=f"Unknown format '{fmt}'. Use: text, srt, vtt, json")
-
     key, filename, media_type = format_map[fmt]
     content = transcript.get(key, "")
     if not content:
-        raise HTTPException(status_code=404, detail=f"Format '{fmt}' not available for this job")
+        return None
+    return content, filename, media_type
 
-    return PlainTextResponse(content, media_type=media_type, headers={
-        "Content-Disposition": f'attachment; filename="{filename}"'
-    })
 
-register_job_websocket_routes(app, jobs, job_transport)
+app.include_router(create_runtime_router(RuntimeRouteDeps(
+    whisper_bin=WHISPER_BIN,
+    models_dir=MODELS_DIR,
+    get_whisper_bin=get_whisper_bin,
+    list_available_models=list_available_models,
+    list_db_jobs=list_db_jobs,
+    search_chunks=search_chunks,
+    list_chunks=list_chunks,
+    start_url_transcription=start_url_transcription,
+    start_file_transcription=start_file_transcription,
+    get_job=get_job_for_api,
+    list_job_artifacts=list_job_artifacts,
+    fetch_runtime_events=runtime_events.fetch_events,
+    runtime_queue_snapshot=runtime_queue_snapshot,
+    recovery_report=lambda: RECOVERY_REPORT,
+    fetch_entity_timeline=runtime_events.fetch_entity_timeline,
+    list_artifact_events=artifacts_repo.list_artifact_events,
+    get_artifact=get_artifact_for_api,
+    generate_artifact=generate_artifact_for_api,
+    download_transcript_payload=download_transcript_payload,
+)))
+
+register_job_websocket_routes(app, job_registry, job_transport)
 register_frontend_routes(app, FRONTEND_DIR)
 
 

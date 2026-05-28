@@ -4,10 +4,10 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc -b && vite build",
+    "dev": "vite --config vite.config.mjs --configLoader native",
+    "build": "tsc -b && vite build --config vite.config.mjs --configLoader native",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview --config vite.config.mjs --configLoader native"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.2.2",

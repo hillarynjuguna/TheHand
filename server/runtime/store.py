@@ -155,8 +155,19 @@ def init_schema() -> bool:
                 high_watermark_timestamp TEXT,
                 created_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS job_registry (
+                id TEXT PRIMARY KEY,
+                status TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                record_json TEXT,
+                snapshot_json TEXT,
+                terminal INTEGER
+            );
             """
         )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_job_registry_status ON job_registry(status);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_job_registry_updated_at ON job_registry(updated_at);")
         try:
             conn.execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS jobs_fts USING fts5(job_id UNINDEXED, source, filename, status, model, language, transcript_text);"

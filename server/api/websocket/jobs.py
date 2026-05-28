@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import MutableMapping
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from runtime.state import JOB_TERMINAL_STATUSES
 from runtime.transport import JobWebSocketTransport, build_job_snapshot
+from runtime.jobs.registry import SQLiteJobRegistry
 
 
-def register_job_websocket_routes(app: FastAPI, jobs: MutableMapping[str, dict], job_transport: JobWebSocketTransport) -> None:
+def register_job_websocket_routes(app: FastAPI, job_registry: SQLiteJobRegistry, job_transport: JobWebSocketTransport) -> None:
     @app.websocket("/ws/job/{job_id}")
     async def job_progress_ws(websocket: WebSocket, job_id: str):
         """
@@ -21,11 +21,11 @@ def register_job_websocket_routes(app: FastAPI, jobs: MutableMapping[str, dict],
         job_transport.register(job_id, websocket)
         try:
             while True:
-                if job_id not in jobs:
+                job = job_registry.get_active_snapshot(job_id)
+                if not job:
                     await websocket.send_json({"error": "job not found"})
                     break
 
-                job = jobs[job_id]
                 await websocket.send_json(build_job_snapshot(job))
 
                 if job["status"] in JOB_TERMINAL_STATUSES:
