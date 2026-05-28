@@ -15,19 +15,26 @@ Directory layout expected:
   └── dist/            ← built frontend (copy from TheHand/dist after npm run build)
 
 whisper.cpp should be compiled at ~/whisper.cpp/build/bin/whisper-cli
+This server persists completed jobs in server/data/thehand.db and stores per-job artifacts under server/data/jobs/.
 """
 
 import asyncio
 import json
+import math
 import os
 import shutil
+import sqlite3
 import subprocess
 import tempfile
+import threading
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, BackgroundTasks
+
+from semantic import build_embedding, chunk_transcript, cosine_similarity
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -55,14 +62,353 @@ FRONTEND_DIR = os.environ.get(
 TEMP_DIR = Path(tempfile.gettempdir()) / "thehand"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
+# Persistent storage and artifacts
+DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATABASE_PATH = DATA_DIR / "thehand.db"
+JOB_ARTIFACTS_DIR = DATA_DIR / "jobs"
+JOB_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+DB_LOCK = threading.Lock()
+FTS_ENABLED = False
+
 # In-memory job store
 jobs: dict[str, dict] = {}
 
 # ---------------------------------------------------------------------------
-# App
+# Persistence helpers
 # ---------------------------------------------------------------------------
 
+def get_db_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _row_to_dict(row: sqlite3.Row) -> dict:
+    return {key: row[key] for key in row.keys()}
+
+
+def _current_timestamp() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+
+
+def init_db() -> None:
+    global FTS_ENABLED
+    with DB_LOCK:
+        conn = get_db_connection()
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS jobs (
+                    job_id TEXT PRIMARY KEY,
+                    source_type TEXT,
+                    source TEXT,
+                    filename TEXT,
+                    status TEXT,
+                    step TEXT,
+                    step_status TEXT,
+                    progress INTEGER,
+                    model TEXT,
+                    language TEXT,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    transcript_text TEXT,
+                    transcript_srt TEXT,
+                    transcript_vtt TEXT,
+                    transcript_json TEXT,
+                    error TEXT,
+                    duration REAL
+                );
+                CREATE TABLE IF NOT EXISTS chunks (
+                    chunk_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT,
+                    chunk_index INTEGER,
+                    start_ts REAL,
+                    end_ts REAL,
+                    text TEXT,
+                    embedding_json TEXT,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    FOREIGN KEY(job_id) REFERENCES jobs(job_id)
+                );
+                """
+            )
+            conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS jobs_fts USING fts5(job_id UNINDEXED, source, filename, status, model, language, transcript_text);"
+            )
+            conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(chunk_id UNINDEXED, job_id UNINDEXED, source, filename, text);"
+            )
+            FTS_ENABLED = True
+        except sqlite3.OperationalError:
+            FTS_ENABLED = False
+        conn.execute(
+            "UPDATE jobs SET status = 'error', error = 'Server restarted while job was pending.', updated_at = ? WHERE status IN ('queued', 'running');",
+            (_current_timestamp(),),
+        )
+        conn.commit()
+        conn.close()
+
+
+def _upsert_search_index(conn: sqlite3.Connection, job: dict) -> None:
+    if not FTS_ENABLED:
+        return
+    conn.execute(
+        "INSERT OR REPLACE INTO jobs_fts(job_id, source, filename, status, model, language, transcript_text) VALUES (?, ?, ?, ?, ?, ?, ?);",
+        (
+            job.get('job_id'),
+            job.get('source') or '',
+            job.get('filename') or '',
+            job.get('status') or '',
+            job.get('model') or '',
+            job.get('language') or '',
+            job.get('transcript_text') or '',
+        ),
+    )
+
+
+def _upsert_chunk_search_index(conn: sqlite3.Connection, chunk: dict, job: dict) -> None:
+    if not FTS_ENABLED:
+        return
+    conn.execute(
+        "INSERT OR REPLACE INTO chunks_fts(chunk_id, job_id, source, filename, text) VALUES (?, ?, ?, ?, ?);",
+        (
+            chunk.get('chunk_id'),
+            job.get('job_id'),
+            job.get('source') or '',
+            job.get('filename') or '',
+            chunk.get('text') or '',
+        ),
+    )
+
+
+def create_chunks_for_job(job_id: str, transcript: dict) -> None:
+    if not transcript:
+        return
+
+    chunks = chunk_transcript(transcript.get('text', ''), transcript.get('json_raw', None))
+    if not chunks:
+        return
+
+    created_at = _current_timestamp()
+    with DB_LOCK, get_db_connection() as conn:
+        job_row = conn.execute("SELECT source, filename FROM jobs WHERE job_id = ?;", (job_id,)).fetchone()
+        source = job_row['source'] if job_row else None
+        filename = job_row['filename'] if job_row else None
+        conn.execute("DELETE FROM chunks WHERE job_id = ?;", (job_id,))
+        for index, chunk in enumerate(chunks):
+            embedding = build_embedding(chunk['text'])
+            cursor = conn.execute(
+                "INSERT INTO chunks (job_id, chunk_index, start_ts, end_ts, text, embedding_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+                (
+                    job_id,
+                    index,
+                    chunk.get('start_ts'),
+                    chunk.get('end_ts'),
+                    chunk['text'],
+                    json.dumps(embedding),
+                    created_at,
+                    created_at,
+                ),
+            )
+            chunk_id = cursor.lastrowid
+            _upsert_chunk_search_index(conn, {
+                'chunk_id': chunk_id,
+                'text': chunk['text'],
+            }, {'job_id': job_id, 'source': source, 'filename': filename})
+        conn.commit()
+
+
+def _db_record_to_job(row: sqlite3.Row) -> dict:
+    job = _row_to_dict(row)
+    job['transcript'] = {
+        'text': job.pop('transcript_text', '') or '',
+        'srt': job.pop('transcript_srt', '') or '',
+        'vtt': job.pop('transcript_vtt', '') or '',
+        'json_raw': job.pop('transcript_json', '') or '',
+    }
+    return job
+
+
+def create_db_job(job: dict) -> None:
+    with DB_LOCK, get_db_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO jobs (job_id, source_type, source, filename, status, step, step_status, progress, model, language, created_at, updated_at, transcript_text, transcript_srt, transcript_vtt, transcript_json, error, duration) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+            (
+                job['id'],
+                job.get('source_type'),
+                job.get('source'),
+                job.get('filename'),
+                job.get('status'),
+                job.get('step'),
+                job.get('step_status'),
+                job.get('progress', 0),
+                job.get('model'),
+                job.get('language'),
+                job.get('created_at'),
+                job.get('updated_at'),
+                None,
+                None,
+                None,
+                None,
+                None,
+                job.get('duration'),
+            ),
+        )
+        _upsert_search_index(conn, {
+            'job_id': job['id'],
+            'source': job.get('source'),
+            'filename': job.get('filename'),
+            'status': job.get('status'),
+            'model': job.get('model'),
+            'language': job.get('language'),
+            'transcript_text': None,
+        })
+        conn.commit()
+
+
+def update_db_job(job_id: str, updates: dict) -> None:
+    if not updates:
+        return
+    updates['updated_at'] = _current_timestamp()
+    keys = ', '.join([f"{k} = ?" for k in updates.keys()])
+    params = list(updates.values()) + [job_id]
+    with DB_LOCK, get_db_connection() as conn:
+        conn.execute(f"UPDATE jobs SET {keys} WHERE job_id = ?;", params)
+        job = conn.execute("SELECT * FROM jobs WHERE job_id = ?;", (job_id,)).fetchone()
+        if job:
+            _upsert_search_index(conn, _row_to_dict(job))
+        conn.commit()
+
+
+def fetch_db_job(job_id: str) -> Optional[dict]:
+    with DB_LOCK, get_db_connection() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE job_id = ?;", (job_id,)).fetchone()
+        if not row:
+            return None
+        return _db_record_to_job(row)
+
+
+def list_db_jobs(search: Optional[str] = None, status: Optional[str] = None, source_type: Optional[str] = None, model: Optional[str] = None, limit: int = 50, offset: int = 0) -> list[dict]:
+    with DB_LOCK, get_db_connection() as conn:
+        where_clauses = []
+        params = []
+
+        if search:
+            if FTS_ENABLED:
+                search_query = ' '.join(search.strip().split())
+                where_clauses.append("job_id IN (SELECT job_id FROM jobs_fts WHERE jobs_fts MATCH ?)")
+                params.append(search_query)
+            else:
+                term = f"%{search}%"
+                where_clauses.append("(source LIKE ? OR filename LIKE ? OR status LIKE ? OR model LIKE ? OR language LIKE ? OR transcript_text LIKE ?)")
+                params.extend([term] * 6)
+
+        if status:
+            where_clauses.append("status = ?")
+            params.append(status)
+        if source_type:
+            where_clauses.append("source_type = ?")
+            params.append(source_type)
+        if model:
+            where_clauses.append("model = ?")
+            params.append(model)
+
+        where_clause = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ''
+        query = (
+            "SELECT j.job_id, j.source_type, j.source, j.filename, j.status, j.step, j.step_status, j.progress, j.model, j.language, j.created_at, j.updated_at, j.error, j.duration, substr(j.transcript_text, 1, 250) AS preview, "
+            "COALESCE(c.chunk_count, 0) AS chunk_count "
+            "FROM jobs j "
+            "LEFT JOIN (SELECT job_id, COUNT(*) AS chunk_count FROM chunks GROUP BY job_id) c ON c.job_id = j.job_id "
+            f"{where_clause} "
+            "ORDER BY j.updated_at DESC LIMIT ? OFFSET ?;"
+        )
+        params.extend([limit, offset])
+        rows = conn.execute(query, tuple(params)).fetchall()
+        return [dict(row) for row in rows]
+
+
+def list_chunks(job_id: Optional[str] = None, search: Optional[str] = None, status: Optional[str] = None, top_k: int = 50, offset: int = 0) -> list[dict]:
+    with DB_LOCK, get_db_connection() as conn:
+        where_clauses = ["1=1"]
+        params: list[Optional[object]] = []
+
+        if job_id:
+            where_clauses.append("c.job_id = ?")
+            params.append(job_id)
+        if status:
+            where_clauses.append("j.status = ?")
+            params.append(status)
+
+        if search and FTS_ENABLED:
+            where_clauses.append("c.chunk_id IN (SELECT chunk_id FROM chunks_fts WHERE chunks_fts MATCH ?)")
+            params.append(' '.join(search.strip().split()))
+        elif search:
+            term = f"%{search}%"
+            where_clauses.append("(c.text LIKE ? OR j.source LIKE ? OR j.filename LIKE ?)")
+            params.extend([term, term, term])
+
+        where_clause = " AND ".join(where_clauses)
+        query = (
+            "SELECT c.chunk_id, c.job_id, c.chunk_index, c.start_ts, c.end_ts, c.text, c.embedding_json, j.source_type, j.source, j.filename, j.status AS job_status, j.model, j.language, j.updated_at AS job_updated_at "
+            "FROM chunks c "
+            "JOIN jobs j ON j.job_id = c.job_id "
+            f"WHERE {where_clause} "
+            "ORDER BY j.updated_at DESC, c.chunk_index ASC LIMIT ? OFFSET ?;"
+        )
+        params.extend([top_k, offset])
+        rows = conn.execute(query, tuple(params)).fetchall()
+        return [dict(row) for row in rows]
+
+
+def search_chunks(query: str, job_id: Optional[str] = None, status: Optional[str] = None, top_k: int = 20) -> list[dict]:
+    candidates = list_chunks(job_id=job_id, search=query, status=status, top_k=max(100, top_k * 5))
+    query_embedding = build_embedding(query)
+    scored = []
+
+    for row in candidates:
+        embedding = []
+        if row.get('embedding_json'):
+            try:
+                embedding = json.loads(row['embedding_json'])
+            except Exception:
+                embedding = []
+        similarity = cosine_similarity(query_embedding, embedding) if embedding else 0.0
+        scored.append((similarity, row))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    results = []
+    for score, row in scored[:top_k]:
+        results.append({
+            'chunk_id': row['chunk_id'],
+            'job_id': row['job_id'],
+            'chunk_index': row['chunk_index'],
+            'start_ts': row['start_ts'],
+            'end_ts': row['end_ts'],
+            'text': row['text'],
+            'score': score,
+            'source_type': row['source_type'],
+            'source': row['source'],
+            'filename': row['filename'],
+            'job_status': row['job_status'],
+            'model': row['model'],
+            'language': row['language'],
+            'job_updated_at': row['job_updated_at'],
+        })
+    return results
+
+
+def persist_job_artifacts(job_id: str, transcript: dict) -> None:
+    job_dir = JOB_ARTIFACTS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    for ext, key in [('.txt', 'text'), ('.srt', 'srt'), ('.vtt', 'vtt'), ('.json', 'json_raw')]:
+        content = transcript.get(key)
+        if content:
+            (job_dir / f"transcript{ext}").write_text(content, encoding='utf-8')
+
 app = FastAPI(title="TheHand Transcription Server", version="1.0.0")
+
+init_db()
 
 app.add_middleware(
     CORSMiddleware,
@@ -118,6 +464,19 @@ def list_available_models() -> list[str]:
 def update_job(job_id: str, **kwargs):
     if job_id in jobs:
         jobs[job_id].update(kwargs)
+
+    db_updates: dict[str, object] = {}
+    for key, value in kwargs.items():
+        if key == 'transcript' and isinstance(value, dict):
+            db_updates['transcript_text'] = value.get('text')
+            db_updates['transcript_srt'] = value.get('srt')
+            db_updates['transcript_vtt'] = value.get('vtt')
+            db_updates['transcript_json'] = value.get('json_raw')
+            continue
+        db_updates[key] = value
+
+    if db_updates:
+        update_db_job(job_id, db_updates)
 
 # ---------------------------------------------------------------------------
 # Core pipeline
@@ -326,7 +685,9 @@ async def run_transcription_job(job_id: str, url: Optional[str], file_path: Opti
         transcript = await run_whisper(wav_path, model, language, job_id)
         update_job(job_id, progress=95)
 
-        # Done
+        # Persist artifacts, create semantic chunks, and finish
+        persist_job_artifacts(job_id, transcript)
+        create_chunks_for_job(job_id, transcript)
         update_job(
             job_id,
             status="done",
@@ -352,7 +713,7 @@ async def health():
     """Health check — also validates whisper and model availability."""
     try:
         whisper_ok = bool(get_whisper_bin())
-    except FileNotFoundError as e:
+    except FileNotFoundError:
         whisper_ok = False
 
     return {
@@ -364,6 +725,55 @@ async def health():
     }
 
 
+@app.get("/api/jobs")
+async def list_jobs(
+    q: Optional[str] = None,
+    status: Optional[str] = None,
+    source_type: Optional[str] = None,
+    model: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    """List saved jobs and search transcripts."""
+    jobs = list_db_jobs(search=q, status=status, source_type=source_type, model=model, limit=limit, offset=offset)
+    return {"jobs": jobs}
+
+
+@app.get("/api/chunks")
+async def get_chunks(
+    q: Optional[str] = None,
+    job_id: Optional[str] = None,
+    status: Optional[str] = None,
+    top_k: int = 20,
+    offset: int = 0,
+):
+    """Search transcript chunks and return semantic results."""
+    if q:
+        chunks = search_chunks(q, job_id=job_id, status=status, top_k=top_k)
+    else:
+        rows = list_chunks(job_id=job_id, status=status, top_k=top_k, offset=offset)
+        chunks = [
+            {
+                'chunk_id': row['chunk_id'],
+                'job_id': row['job_id'],
+                'chunk_index': row['chunk_index'],
+                'start_ts': row['start_ts'],
+                'end_ts': row['end_ts'],
+                'text': row['text'],
+                'score': None,
+                'source_type': row['source_type'],
+                'source': row['source'],
+                'filename': row['filename'],
+                'job_status': row['job_status'],
+                'model': row['model'],
+                'language': row['language'],
+                'job_updated_at': row['job_updated_at'],
+            }
+            for row in rows
+        ]
+    return {"chunks": chunks}
+
+
 @app.get("/api/models")
 async def get_models():
     """List available Whisper models."""
@@ -372,25 +782,30 @@ async def get_models():
 
 @app.post("/api/transcribe/url")
 async def transcribe_url(
-    background_tasks,
+    background_tasks: BackgroundTasks,
     url: str = Form(...),
     model: str = Form("small"),
     language: str = Form("auto"),
 ):
     """Start a transcription job from a URL. Returns job_id immediately."""
     job_id = str(uuid.uuid4())
+    created_at = _current_timestamp()
     jobs[job_id] = {
         "id": job_id,
         "status": "queued",
         "step": "yt-dlp",
         "step_status": "pending",
         "progress": 0,
-        "url": url,
+        "source_type": "url",
+        "source": url,
         "model": model,
         "language": language,
+        "created_at": created_at,
+        "updated_at": created_at,
         "transcript": None,
         "error": None,
     }
+    create_db_job(jobs[job_id])
     asyncio.create_task(run_transcription_job(job_id, url, None, model, language))
     return {"job_id": job_id}
 
@@ -412,18 +827,24 @@ async def transcribe_file(
         content = await file.read()
         f.write(content)
 
+    created_at = _current_timestamp()
     jobs[job_id] = {
         "id": job_id,
         "status": "queued",
         "step": "ffmpeg",
         "step_status": "pending",
         "progress": 0,
+        "source_type": "file",
+        "source": file.filename,
         "filename": file.filename,
         "model": model,
         "language": language,
+        "created_at": created_at,
+        "updated_at": created_at,
         "transcript": None,
         "error": None,
     }
+    create_db_job(jobs[job_id])
     asyncio.create_task(run_transcription_job(job_id, None, upload_path, model, language))
     return {"job_id": job_id}
 
@@ -431,17 +852,24 @@ async def transcribe_file(
 @app.get("/api/job/{job_id}")
 async def get_job_status(job_id: str):
     """Poll job status and retrieve transcript when done."""
-    if job_id not in jobs:
+    if job_id in jobs:
+        return jobs[job_id]
+
+    saved = fetch_db_job(job_id)
+    if not saved:
         raise HTTPException(status_code=404, detail="Job not found")
-    return jobs[job_id]
+    return saved
 
 
 @app.get("/api/job/{job_id}/download/{fmt}")
 async def download_transcript(job_id: str, fmt: str):
     """Download transcript in a specific format: text, srt, vtt, json."""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    job = jobs[job_id]
+    if job_id in jobs:
+        job = jobs[job_id]
+    else:
+        job = fetch_db_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
     if job["status"] != "done":
         raise HTTPException(status_code=400, detail="Job not complete yet")
 

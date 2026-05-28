@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import gsap from 'gsap';
 
 const NAV_LINKS = [
+  { label: 'Library', href: '#library' },
   { label: 'How It Works', href: '#how-it-works' },
   { label: 'Setup', href: '#setup' },
   { label: 'GitHub', href: 'https://github.com/ggml-org/whisper.cpp', external: true },

@@ -18,7 +18,11 @@ const STEP_KEY_TO_INDEX: Record<string, number> = {
 // From another device on the same Wi-Fi: http://<phone-ip>:8080
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:8080';
 
-export default function Hero() {
+type HeroProps = {
+  onJobDone?: () => void;
+};
+
+export default function Hero({ onJobDone }: HeroProps) {
   const canvasRef   = useRef<HTMLCanvasElement>(null);
   const cardRef     = useRef<HTMLDivElement>(null);
   const inputRef    = useRef<HTMLInputElement>(null);
@@ -35,8 +39,28 @@ export default function Hero() {
   const [jobId, setJobId]               = useState<string | null>(null);
   const [useDemo, setUseDemo]           = useState(false);
   const [serverOk, setServerOk]         = useState<boolean | null>(null);
+  const [models, setModels] = useState<string[]>([]);
+  const [selectedModel, setSelectedModel] = useState<string>('small');
 
   useOrganicFlow(canvasRef);
+
+  // fetch models once
+  useEffect(() => {
+    let mounted = true;
+    fetch(`${API_BASE}/api/models`).then(async (r) => {
+      if (!mounted) return;
+      if (!r.ok) return;
+      try {
+        const json = await r.json();
+        if (Array.isArray(json.models)) {
+          setModels(json.models);
+          if (json.models.includes('small')) setSelectedModel('small');
+          else if (json.models.length) setSelectedModel(json.models[0]);
+        }
+      } catch {}
+    }).catch(() => {});
+    return () => { mounted = false; };
+  }, []);
 
   // Check if the server is reachable on mount
   useEffect(() => {
@@ -95,36 +119,102 @@ export default function Hero() {
     try {
       const body = new FormData();
       body.append('url', sourceUrl);
-      body.append('model', 'small');
+      body.append('model', selectedModel || 'small');
       body.append('language', 'auto');
 
       const res = await fetch(`${API_BASE}/api/transcribe/url`, { method: 'POST', body });
-      if (!res.ok) throw new Error(`Server error ${res.status}`);
+      if (!res.ok) {
+        // try to parse friendly server error
+        let detail = '';
+        try {
+          const json = await res.json();
+          // FastAPI common validation detail shape
+          if (json?.detail) {
+            if (Array.isArray(json.detail)) {
+              detail = json.detail.map((d: any) => d?.msg ?? JSON.stringify(d)).join('; ');
+            } else if (typeof json.detail === 'string') {
+              detail = json.detail;
+            } else if (json.detail.msg) {
+              detail = json.detail.msg;
+            } else {
+              detail = JSON.stringify(json.detail);
+            }
+          } else {
+            detail = JSON.stringify(json);
+          }
+        } catch (e) {
+          try { detail = await res.text(); } catch { detail = ''; }
+        }
+        // Map common validation messages to user-friendly strings
+        const lower = (detail || '').toLowerCase();
+        let friendly = `Server returned ${res.status}`;
+        if (res.status === 422) {
+          if (lower.includes('field required') || lower.includes('required')) friendly = 'Missing form field — please ensure a URL is provided.';
+          else if (lower.includes('value is not a valid')) friendly = 'Invalid value submitted. Please check the URL format.';
+          else friendly = 'Invalid request — please check the input and try again.';
+        } else if (res.status === 400) {
+          friendly = detail || 'Bad request';
+        } else if (res.status >= 500) {
+          friendly = 'Server error — check backend logs for details.';
+        }
+        throw new Error(`${friendly}${detail ? ` (${detail})` : ''}`);
+      }
       const { job_id } = await res.json();
       setJobId(job_id);
+      // Try websocket for live updates; fallback to polling
+      const wsUrl = `${API_BASE.replace(/^http/, 'ws')}/ws/job/${job_id}`;
+      let ws: WebSocket | null = null;
+      let usedWebsocket = false;
+      try {
+        ws = new WebSocket(wsUrl);
+        ws.onopen = () => { usedWebsocket = true; };
+        ws.onmessage = (ev) => {
+          try {
+            const status = JSON.parse(ev.data);
+            const stepIdx = STEP_KEY_TO_INDEX[status.step] ?? -1;
+            setActiveStep(stepIdx);
+            if (status.status === 'done') {
+              ws?.close();
+              setActiveStep(3);
+              setTranscript(status.transcript?.text ?? 'No transcript returned.');
+              setIsTranscribing(false);
+              onJobDone?.();
+            } else if (status.status === 'error') {
+              ws?.close();
+              setError(status.error ?? status?.detail ?? 'Unknown error');
+              setIsTranscribing(false);
+            }
+          } catch (e) { /* ignore malformed messages */ }
+        };
+        ws.onerror = () => { /* fall back */ };
+        ws.onclose = (e) => {
+          // if websocket never became useful, start polling
+          if (!usedWebsocket) startPolling(job_id);
+        };
+      } catch (e) {
+        startPolling(job_id);
+      }
 
-      // Poll every 800 ms
-      pollRef.current = setInterval(async () => {
-        try {
-          const status = await fetch(`${API_BASE}/api/job/${job_id}`).then(r => r.json());
-
-          const stepIdx = STEP_KEY_TO_INDEX[status.step] ?? -1;
-          setActiveStep(stepIdx);
-
-          if (status.status === 'done') {
-            clearInterval(pollRef.current!);
-            setActiveStep(3);
-            setTranscript(status.transcript?.text ?? 'No transcript returned.');
-            setIsTranscribing(false);
-          } else if (status.status === 'error') {
-            clearInterval(pollRef.current!);
-            setError(status.error ?? 'Unknown error');
-            setIsTranscribing(false);
-          }
-        } catch {
-          // poll failure — keep trying
-        }
-      }, 800);
+      function startPolling(job_id_inner: string) {
+        pollRef.current = setInterval(async () => {
+          try {
+            const status = await fetch(`${API_BASE}/api/job/${job_id_inner}`).then(r => r.json());
+            const stepIdx = STEP_KEY_TO_INDEX[status.step] ?? -1;
+            setActiveStep(stepIdx);
+            if (status.status === 'done') {
+              clearInterval(pollRef.current!);
+              setActiveStep(3);
+              setTranscript(status.transcript?.text ?? 'No transcript returned.');
+              setIsTranscribing(false);
+              onJobDone?.();
+            } else if (status.status === 'error') {
+              clearInterval(pollRef.current!);
+              setError(status.error ?? 'Unknown error');
+              setIsTranscribing(false);
+            }
+          } catch { /* ignore */ }
+        }, 800);
+      }
 
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Request failed');
@@ -133,7 +223,12 @@ export default function Hero() {
   }, []);
 
   const handleTranscribe = () => {
-    if (!url.trim() || isTranscribing) return;
+    if (isTranscribing) return;
+    if (!url.trim()) {
+      setError('Please paste a valid URL before transcribing.');
+      inputRef.current?.focus();
+      return;
+    }
     if (serverOk) {
       runRealTranscription(url.trim());
     } else {
@@ -180,6 +275,7 @@ export default function Hero() {
               setActiveStep(3);
               setTranscript(status.transcript?.text ?? '');
               setIsTranscribing(false);
+              onJobDone?.();
             } else if (status.status === 'error') {
               clearInterval(pollRef.current!);
               setError(status.error ?? 'Unknown error');
@@ -208,8 +304,8 @@ export default function Hero() {
   };
 
   return (
-    <section className="relative w-full overflow-hidden" style={{ height: '100vh' }}>
-      <canvas ref={canvasRef} style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', zIndex: 0 }} />
+    <section className="relative w-full overflow-hidden" style={{ minHeight: '100vh' }}>
+      <canvas ref={canvasRef} style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', zIndex: 0, pointerEvents: 'none' }} />
 
       <div className="relative flex items-center justify-center px-6" style={{ zIndex: 2, height: '100%', paddingTop: '64px' }}>
         <div
@@ -255,20 +351,32 @@ export default function Hero() {
             <input
               ref={inputRef}
               type="text"
+              aria-label="Audio or video URL"
               placeholder="Paste YouTube, TikTok, or audio URL..."
               value={url}
               onChange={(e) => setUrl(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && handleTranscribe()}
-              className="w-full h-14 px-5 text-base outline-none transition-all duration-300"
+              className="w-full h-14 px-5 text-base outline-none transition-all duration-300 placeholder:text-[#9A9A9A]"
               style={{
-                background: 'rgba(255,255,255,0.6)',
-                border: '1px solid rgba(26,26,26,0.1)',
+                background: '#FFFFFF',
+                border: '1px solid rgba(26,26,26,0.16)',
                 borderRadius: '12px',
                 fontFamily: "'Inter', sans-serif", fontSize: '16px', color: '#1A1A1A',
               }}
               onFocus={(e) => { e.currentTarget.style.borderColor = '#C17F59'; e.currentTarget.style.boxShadow = '0 0 0 3px rgba(193,127,89,0.15)'; }}
               onBlur={(e) => { e.currentTarget.style.borderColor = 'rgba(26,26,26,0.1)'; e.currentTarget.style.boxShadow = 'none'; }}
             />
+            {/* model selector */}
+            {models.length > 0 && (
+              <div className="w-full flex items-center gap-3">
+                <label className="text-sm" style={{ color: '#6B6560', fontFamily: "'Inter', sans-serif" }}>Model</label>
+                <select value={selectedModel} onChange={(e) => setSelectedModel(e.target.value)}
+                  className="h-10 px-3 rounded-md"
+                  style={{ border: '1px solid rgba(26,26,26,0.08)', background: '#FFF' }}>
+                  {models.map((m) => <option key={m} value={m}>{m}</option>)}
+                </select>
+              </div>
+            )}
             <button
               ref={btnRef}
               onClick={handleTranscribe}

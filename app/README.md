@@ -12,6 +12,8 @@ Built on top of **whisper.cpp** (OpenAI's Whisper model, compiled in C++ for ARM
 
 - Paste any YouTube, TikTok, Instagram, podcast, or audio URL — it downloads, converts, and transcribes automatically
 - Upload a local audio or video file directly from the browser
+- Save completed transcriptions to a persistent local library that survives restarts
+- Search and browse saved transcripts with metadata, status, and preview
 - Watch the pipeline run in real time (yt-dlp → ffmpeg → whisper.cpp)
 - Export transcripts as plain text, SRT subtitles, VTT web captions, or timestamped JSON
 - Choose from multiple Whisper model sizes (tiny 75MB → large-v3 3GB) to balance speed vs accuracy
