@@ -97,6 +97,8 @@ export default function Library({ refreshKey }: LibraryProps) {
   const [statusFilter, setStatusFilter] = useState('');
   const [loading, setLoading] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [artifacts, setArtifacts] = useState<any[]>([]);
+  const [selectedArtifact, setSelectedArtifact] = useState<any | null>(null);
   const [error, setError] = useState('');
 
   useEffect(() => {
@@ -175,11 +177,48 @@ export default function Library({ refreshKey }: LibraryProps) {
       }
       const data = await response.json();
       setSelectedJob(data as JobDetail);
+      fetchArtifacts(jobId);
       setSelectedChunk(null);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Unable to load job details.');
     } finally {
       setDetailLoading(false);
+    }
+  }
+
+  async function fetchArtifacts(jobId: string) {
+    try {
+      const response = await fetch(`${API_BASE}/api/job/${jobId}/artifacts`);
+      if (!response.ok) throw new Error('Unable to fetch artifacts');
+      const data = await response.json();
+      setArtifacts(data.artifacts ?? []);
+      setSelectedArtifact(null);
+    } catch (err) {
+      setArtifacts([]);
+    }
+  }
+
+  async function viewArtifact(a: any) {
+    try {
+      const res = await fetch(`${API_BASE}/api/artifact/${a.artifact_id}`);
+      if (!res.ok) throw new Error('Unable to load artifact');
+      const data = await res.json();
+      setSelectedArtifact(data);
+    } catch (err) {
+      setSelectedArtifact(null);
+    }
+  }
+
+  async function generateArtifact(artifactType: string) {
+    if (!selectedJob) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/job/${selectedJob.job_id}/generate/${artifactType}`, { method: 'POST' });
+      if (!res.ok) throw new Error('Generation failed');
+      await res.json();
+      // refresh artifacts list
+      setTimeout(() => fetchArtifacts(selectedJob.job_id), 500);
+    } catch (err) {
+      // ignore for now
     }
   }
 
@@ -507,6 +546,45 @@ export default function Library({ refreshKey }: LibraryProps) {
                     >
                       Export JSON
                     </button>
+                  </div>
+                  <div className="mt-6">
+                    <div className="mb-3 flex items-center justify-between">
+                      <div className="text-sm font-semibold">Derived artifacts</div>
+                      <div className="text-xs text-[#6B6560]">Generate: 
+                        <button onClick={() => generateArtifact('summary')} className="ml-2 text-xs px-2 py-1 rounded bg-[#1A1A1A] text-white">Summary</button>
+                        <button onClick={() => generateArtifact('chapter_map')} className="ml-2 text-xs px-2 py-1 rounded bg-[#E8DDD0] text-[#1A1A1A]">Chapters</button>
+                        <button onClick={() => generateArtifact('entities')} className="ml-2 text-xs px-2 py-1 rounded bg-[#F5E1D6] text-[#7B2F2F]">Entities</button>
+                        <button onClick={() => generateArtifact('topics')} className="ml-2 text-xs px-2 py-1 rounded bg-[#F5E1D6] text-[#7B2F2F]">Topics</button>
+                        <button onClick={() => generateArtifact('quotes')} className="ml-2 text-xs px-2 py-1 rounded bg-[#F5E1D6] text-[#7B2F2F]">Quotes</button>
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-1 gap-3">
+                      {artifacts.length === 0 ? (
+                        <div className="text-sm text-[#6B6560]">No artifacts yet. Generate one to create persistent derived outputs.</div>
+                      ) : (
+                        artifacts.map((a) => (
+                          <div key={a.artifact_id} className="p-3 rounded-lg border" style={{ borderColor: 'rgba(26,26,26,0.06)' }}>
+                            <div className="flex items-center justify-between">
+                              <div>
+                                <div className="font-semibold">{a.title || a.artifact_type}</div>
+                                <div className="text-xs text-[#6B6560]">{a.artifact_type} • {a.generation_status}</div>
+                              </div>
+                              <div className="flex gap-2">
+                                <button onClick={() => viewArtifact(a)} className="text-sm px-3 py-1 rounded bg-[#1A1A1A] text-white">View</button>
+                              </div>
+                            </div>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                    {selectedArtifact && (
+                      <div className="mt-4 p-4 rounded-lg border bg-[#F8F6F2]" style={{ borderColor: 'rgba(26,26,26,0.06)' }}>
+                        <div className="mb-2 font-semibold">{selectedArtifact.artifact_type} — {selectedArtifact.title}</div>
+                        <pre className="whitespace-pre-wrap text-sm" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
+                          {selectedArtifact.persisted ? JSON.stringify(selectedArtifact.persisted, null, 2) : (selectedArtifact.content || 'No content yet.')}
+                        </pre>
+                      </div>
+                    )}
                   </div>
                 </>
               ) : (

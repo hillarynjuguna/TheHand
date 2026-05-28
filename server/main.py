@@ -131,6 +131,29 @@ def init_db() -> None:
                     updated_at TEXT,
                     FOREIGN KEY(job_id) REFERENCES jobs(job_id)
                 );
+                CREATE TABLE IF NOT EXISTS artifacts (
+                    artifact_id TEXT PRIMARY KEY,
+                    job_id TEXT,
+                    artifact_type TEXT,
+                    title TEXT,
+                    content TEXT,
+                    metadata_json TEXT,
+                    embedding_json TEXT,
+                    generation_model TEXT,
+                    generation_status TEXT,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    FOREIGN KEY(job_id) REFERENCES jobs(job_id)
+                );
+                CREATE TABLE IF NOT EXISTS artifact_versions (
+                    version_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    artifact_id TEXT,
+                    version_number INTEGER,
+                    content TEXT,
+                    metadata_json TEXT,
+                    created_at TEXT,
+                    FOREIGN KEY(artifact_id) REFERENCES artifacts(artifact_id)
+                );
                 """
             )
             conn.execute(
@@ -405,6 +428,79 @@ def persist_job_artifacts(job_id: str, transcript: dict) -> None:
         content = transcript.get(key)
         if content:
             (job_dir / f"transcript{ext}").write_text(content, encoding='utf-8')
+
+
+def _artifact_dir_for(job_id: str) -> Path:
+    path = JOB_ARTIFACTS_DIR / job_id / "artifacts"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def create_artifact_record(job_id: str, artifact_type: str, title: str | None, content: str | None, metadata: dict | None, generation_model: str | None, generation_status: str = 'queued') -> str:
+    artifact_id = str(uuid.uuid4())
+    ts = _current_timestamp()
+    with DB_LOCK, get_db_connection() as conn:
+        conn.execute(
+            "INSERT INTO artifacts (artifact_id, job_id, artifact_type, title, content, metadata_json, embedding_json, generation_model, generation_status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+            (
+                artifact_id,
+                job_id,
+                artifact_type,
+                title or '',
+                content or '',
+                json.dumps(metadata or {}),
+                json.dumps(None),
+                generation_model or '',
+                generation_status,
+                ts,
+                ts,
+            ),
+        )
+        conn.commit()
+    return artifact_id
+
+
+def update_artifact_record(artifact_id: str, updates: dict) -> None:
+    if not updates:
+        return
+    updates['updated_at'] = _current_timestamp()
+    keys = ', '.join([f"{k} = ?" for k in updates.keys()])
+    params = list(updates.values()) + [artifact_id]
+    with DB_LOCK, get_db_connection() as conn:
+        conn.execute(f"UPDATE artifacts SET {keys} WHERE artifact_id = ?;", params)
+        conn.commit()
+
+
+def fetch_artifact_record(artifact_id: str) -> Optional[dict]:
+    with DB_LOCK, get_db_connection() as conn:
+        row = conn.execute("SELECT * FROM artifacts WHERE artifact_id = ?;", (artifact_id,)).fetchone()
+        if not row:
+            return None
+        result = _row_to_dict(row)
+        try:
+            result['metadata'] = json.loads(result.get('metadata_json') or '{}')
+        except Exception:
+            result['metadata'] = {}
+        return result
+
+
+def list_job_artifacts(job_id: str) -> list[dict]:
+    with DB_LOCK, get_db_connection() as conn:
+        rows = conn.execute("SELECT artifact_id, job_id, artifact_type, title, generation_status, created_at, updated_at FROM artifacts WHERE job_id = ? ORDER BY updated_at DESC;", (job_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def persist_artifact_content(job_id: str, artifact_id: str, content: str, metadata: dict | None = None) -> None:
+    art_dir = _artifact_dir_for(job_id)
+    path = art_dir / f"{artifact_id}.json"
+    payload = {
+        'artifact_id': artifact_id,
+        'job_id': job_id,
+        'content': content,
+        'metadata': metadata or {},
+        'created_at': _current_timestamp(),
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
 
 app = FastAPI(title="TheHand Transcription Server", version="1.0.0")
 
@@ -859,6 +955,139 @@ async def get_job_status(job_id: str):
     if not saved:
         raise HTTPException(status_code=404, detail="Job not found")
     return saved
+
+
+@app.get("/api/job/{job_id}/artifacts")
+async def api_list_job_artifacts(job_id: str):
+    """List artifacts derived from a job."""
+    # validate job exists
+    saved = fetch_db_job(job_id)
+    if not saved:
+        raise HTTPException(status_code=404, detail="Job not found")
+    arts = list_job_artifacts(job_id)
+    return {"artifacts": arts}
+
+
+@app.get("/api/artifact/{artifact_id}")
+async def api_get_artifact(artifact_id: str):
+    rec = fetch_artifact_record(artifact_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    # try to load persisted content file
+    job_id = rec.get('job_id')
+    art_path = _artifact_dir_for(job_id) / f"{artifact_id}.json"
+    content = None
+    if art_path.exists():
+        try:
+            content = json.loads(art_path.read_text(encoding='utf-8'))
+        except Exception:
+            content = None
+    rec['persisted'] = content
+    return rec
+
+
+async def generate_artifact_job(artifact_id: str, job_id: str, artifact_type: str, generation_model: str | None = None):
+    """Background generator — mocked heuristics that produce artifact content and persist it."""
+    try:
+        update_artifact_record(artifact_id, {'generation_status': 'running'})
+
+        # load transcript and chunks
+        job = fetch_db_job(job_id)
+        if not job:
+            update_artifact_record(artifact_id, {'generation_status': 'error', 'content': ''})
+            return
+
+        transcript = job.get('transcript', {})
+        # naive summary: first N characters or stitched first 3 chunks
+        chunks_rows = []
+        with DB_LOCK, get_db_connection() as conn:
+            rows = conn.execute("SELECT chunk_index, start_ts, end_ts, text FROM chunks WHERE job_id = ? ORDER BY chunk_index ASC LIMIT 20;", (job_id,)).fetchall()
+            chunks_rows = [dict(r) for r in rows]
+
+        if artifact_type == 'summary':
+            if chunks_rows:
+                summary = '\n\n'.join([c['text'] for c in chunks_rows[:3]])
+            else:
+                summary = (transcript.get('text') or '')[:1600]
+            content = summary.strip()
+            metadata = {'method': 'heuristic', 'source': 'chunks' if chunks_rows else 'transcript'}
+
+        elif artifact_type == 'chapter_map':
+            chapters = []
+            if chunks_rows:
+                # group by every ~5 chunks as simple chapter heuristic
+                chunk_group = 5
+                for i in range(0, len(chunks_rows), chunk_group):
+                    group = chunks_rows[i:i+chunk_group]
+                    title = group[0]['text'][:80].strip()
+                    start = group[0].get('start_ts')
+                    end = group[-1].get('end_ts')
+                    chapters.append({'title': title, 'start_ts': start, 'end_ts': end})
+            content = json.dumps({'chapters': chapters}, ensure_ascii=False)
+            metadata = {'method': 'chunk_grouping', 'group_size': 5}
+
+        elif artifact_type == 'entities':
+            text = '\n'.join([c['text'] for c in chunks_rows]) if chunks_rows else (transcript.get('text') or '')
+            # naive entity extraction: capitalized words frequency
+            import re
+            words = re.findall(r"\b([A-Z][a-z]{2,})\b", text)
+            freq = {}
+            for w in words:
+                freq[w] = freq.get(w, 0) + 1
+            entities = sorted([{'entity': k, 'count': v} for k, v in freq.items()], key=lambda x: -x['count'])[:60]
+            content = json.dumps({'entities': entities}, ensure_ascii=False)
+            metadata = {'method': 'heuristic-capitalized-words'}
+
+        elif artifact_type == 'topics':
+            text = '\n'.join([c['text'] for c in chunks_rows]) if chunks_rows else (transcript.get('text') or '')
+            # naive topic extraction: top words excluding stopwords
+            stop = set(['the','and','for','with','that','this','have','from','are','was','were','what','which','when','where','you','your','will','shall','but','not','can','have','has'])
+            import re
+            words = [w.lower() for w in re.findall(r"\b([A-Za-z]{3,})\b", text)]
+            freq = {}
+            for w in words:
+                if w in stop: continue
+                freq[w] = freq.get(w, 0) + 1
+            topics = sorted([{'topic': k, 'count': v} for k, v in freq.items()], key=lambda x: -x['count'])[:40]
+            content = json.dumps({'topics': topics}, ensure_ascii=False)
+            metadata = {'method': 'heuristic-top-words'}
+
+        elif artifact_type == 'quotes':
+            text = '\n'.join([c['text'] for c in chunks_rows]) if chunks_rows else (transcript.get('text') or '')
+            import re
+            quotes = re.findall(r'"([^"]{20,200})"', text)
+            quotes = quotes[:80]
+            content = json.dumps({'quotes': quotes}, ensure_ascii=False)
+            metadata = {'method': 'heuristic-quote-extract'}
+
+        else:
+            content = f"Unsupported artifact type: {artifact_type}"
+            metadata = {'method': 'none'}
+
+        # persist
+        persist_artifact_content(job_id, artifact_id, content, metadata)
+        # update artifact record and add a version
+        update_artifact_record(artifact_id, {'generation_status': 'done', 'content': content, 'metadata_json': json.dumps(metadata)})
+        with DB_LOCK, get_db_connection() as conn:
+            conn.execute("INSERT INTO artifact_versions (artifact_id, version_number, content, metadata_json, created_at) VALUES (?, ?, ?, ?, ?);", (artifact_id, 1, content, json.dumps(metadata), _current_timestamp()))
+            conn.commit()
+
+    except Exception as exc:
+        update_artifact_record(artifact_id, {'generation_status': 'error', 'content': str(exc)})
+
+
+@app.post("/api/job/{job_id}/generate/{artifact_type}")
+async def api_generate_artifact(job_id: str, artifact_type: str, generation_model: Optional[str] = None):
+    """Trigger generation of an artifact for a job. Returns artifact_id immediately."""
+    saved = fetch_db_job(job_id)
+    if not saved:
+        raise HTTPException(status_code=404, detail="Job not found")
+    # create artifact record
+    title = f"{artifact_type} for {job_id}" 
+    artifact_id = create_artifact_record(job_id, artifact_type, title, '', None, generation_model, generation_status='queued')
+    # start background task
+    asyncio.create_task(generate_artifact_job(artifact_id, job_id, artifact_type, generation_model))
+    return {"artifact_id": artifact_id}
 
 
 @app.get("/api/job/{job_id}/download/{fmt}")
