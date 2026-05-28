@@ -11,13 +11,15 @@ echo "║   TheHand — Termux Setup             ║"
 echo "╚══════════════════════════════════════╝"
 echo ""
 
-# 1. System packages
+# 1. System packages (rust required for pydantic-core, nodejs for frontend build)
 echo "→ Installing system packages..."
 pkg update -y && pkg upgrade -y
-pkg install -y python ffmpeg clang cmake git
+pkg install -y python ffmpeg clang cmake git nodejs rust
 
 # 2. Python deps
+# ANDROID_API_LEVEL required by maturin when building pydantic-core from source
 echo "→ Installing Python packages..."
+export ANDROID_API_LEVEL=24
 pip install -r "$REPO_DIR/server/requirements.txt"
 
 # 3. whisper.cpp
@@ -40,16 +42,11 @@ fi
 # 4. Build frontend
 echo "→ Building React frontend..."
 cd "$REPO_DIR/app"
-if ! command -v node &>/dev/null; then
-  echo "  ⚠  Node.js not found. Install from https://nodejs.org then re-run."
-  echo "     Or build on a desktop and copy app/dist → server/dist manually."
-else
-  npm install
-  npm run build
-  echo "→ Copying dist to server/dist..."
-  rm -rf "$REPO_DIR/server/dist"
-  cp -r "$REPO_DIR/app/dist" "$REPO_DIR/server/dist"
-fi
+npm install --legacy-peer-deps
+npm run build
+echo "→ Copying dist to server/dist..."
+rm -rf "$REPO_DIR/server/dist"
+cp -r "$REPO_DIR/app/dist" "$REPO_DIR/server/dist"
 
 echo ""
 echo "✅ Setup complete."
