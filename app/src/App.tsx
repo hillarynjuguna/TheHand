@@ -6,6 +6,7 @@ import SetupGuide from './sections/SetupGuide';
 import Architecture from './sections/Architecture';
 import ModelComparison from './sections/ModelComparison';
 import Footer from './sections/Footer';
+import InstallBanner from './components/InstallBanner';
 
 function App() {
   return (
@@ -18,6 +19,7 @@ function App() {
       <Architecture />
       <ModelComparison />
       <Footer />
+      <InstallBanner />
     </div>
   );
 }

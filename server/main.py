@@ -123,6 +123,68 @@ def update_job(job_id: str, **kwargs):
 # Core pipeline
 # ---------------------------------------------------------------------------
 
+def detect_platform(url: str) -> str:
+    """Identify the platform from a URL for platform-specific handling."""
+    url_lower = url.lower()
+    if "tiktok.com" in url_lower:
+        return "tiktok"
+    if "instagram.com" in url_lower:
+        return "instagram"
+    if "youtube.com" in url_lower or "youtu.be" in url_lower:
+        return "youtube"
+    if "twitter.com" in url_lower or "x.com" in url_lower:
+        return "twitter"
+    return "generic"
+
+
+def build_ytdlp_cmd(url: str, out_path: str) -> list[str]:
+    """Build yt-dlp command with platform-specific options."""
+    platform = detect_platform(url)
+
+    base_cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--extract-audio",
+        "--audio-format", "best",
+        "--audio-quality", "0",
+        "--no-warnings",
+        "--retries", "3",
+        "--fragment-retries", "3",
+        "-o", out_path,
+    ]
+
+    # TikTok: mobile user-agent works best; avoid rate limits
+    if platform == "tiktok":
+        base_cmd += [
+            "--user-agent",
+            "Mozilla/5.0 (Linux; Android 12; SM-G991B) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+            "--add-header", "Referer:https://www.tiktok.com/",
+        ]
+
+    # Instagram: needs a browser-style referer; optional cookies file
+    elif platform == "instagram":
+        base_cmd += [
+            "--user-agent",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            "--add-header", "Referer:https://www.instagram.com/",
+        ]
+        # If user has exported Instagram cookies (see README), use them
+        cookies_file = Path.home() / ".thehand" / "instagram-cookies.txt"
+        if cookies_file.exists():
+            base_cmd += ["--cookies", str(cookies_file)]
+
+    # YouTube: cookies from browser help with age-gated content
+    elif platform == "youtube":
+        cookies_file = Path.home() / ".thehand" / "youtube-cookies.txt"
+        if cookies_file.exists():
+            base_cmd += ["--cookies", str(cookies_file)]
+
+    base_cmd.append(url)
+    return base_cmd
+
+
 async def download_audio(url: str, job_id: str) -> Path:
     """Use yt-dlp to download audio from a URL."""
     out_path = TEMP_DIR / job_id / "audio.%(ext)s"
@@ -130,15 +192,7 @@ async def download_audio(url: str, job_id: str) -> Path:
 
     update_job(job_id, step="yt-dlp", step_status="running")
 
-    cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "--extract-audio",
-        "--audio-format", "best",
-        "--audio-quality", "0",
-        "-o", str(out_path),
-        url,
-    ]
+    cmd = build_ytdlp_cmd(url, str(out_path))
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -148,7 +202,16 @@ async def download_audio(url: str, job_id: str) -> Path:
     stdout, stderr = await proc.communicate()
 
     if proc.returncode != 0:
-        raise RuntimeError(f"yt-dlp failed:\n{stderr.decode()}")
+        err = stderr.decode()
+        # Surface helpful hints for common failures
+        if "login" in err.lower() or "private" in err.lower():
+            raise RuntimeError(
+                f"This content requires login.\n"
+                f"Export your cookies (see README) to ~/.thehand/instagram-cookies.txt\n\n{err}"
+            )
+        if "unavailable" in err.lower() or "removed" in err.lower():
+            raise RuntimeError(f"Content unavailable or removed.\n\n{err}")
+        raise RuntimeError(f"yt-dlp failed:\n{err}")
 
     # Find the downloaded file (extension varies)
     for f in (TEMP_DIR / job_id).iterdir():
