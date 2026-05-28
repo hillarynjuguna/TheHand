@@ -31,6 +31,8 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+import hashlib
+import logging
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, BackgroundTasks
 
@@ -165,6 +167,23 @@ def init_db() -> None:
             FTS_ENABLED = True
         except sqlite3.OperationalError:
             FTS_ENABLED = False
+        # Ensure artifact schema has recommended columns for dependency, attempts, and errors
+        try:
+            conn.execute("ALTER TABLE artifacts ADD COLUMN depends_on TEXT;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE artifacts ADD COLUMN input_hash TEXT;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE artifacts ADD COLUMN generation_attempts INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE artifacts ADD COLUMN generation_error TEXT;")
+        except Exception:
+            pass
         conn.execute(
             "UPDATE jobs SET status = 'error', error = 'Server restarted while job was pending.', updated_at = ? WHERE status IN ('queued', 'running');",
             (_current_timestamp(),),
@@ -240,6 +259,14 @@ def create_chunks_for_job(job_id: str, transcript: dict) -> None:
                 'text': chunk['text'],
             }, {'job_id': job_id, 'source': source, 'filename': filename})
         conn.commit()
+
+
+def _compute_hash(text: str | None) -> str | None:
+    if not text:
+        return None
+    h = hashlib.sha256()
+    h.update(text.encode('utf-8'))
+    return h.hexdigest()
 
 
 def _db_record_to_job(row: sqlite3.Row) -> dict:
@@ -441,7 +468,7 @@ def create_artifact_record(job_id: str, artifact_type: str, title: str | None, c
     ts = _current_timestamp()
     with DB_LOCK, get_db_connection() as conn:
         conn.execute(
-            "INSERT INTO artifacts (artifact_id, job_id, artifact_type, title, content, metadata_json, embedding_json, generation_model, generation_status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+            "INSERT INTO artifacts (artifact_id, job_id, artifact_type, title, content, metadata_json, embedding_json, generation_model, generation_status, created_at, updated_at, depends_on, input_hash, generation_attempts, generation_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
             (
                 artifact_id,
                 job_id,
@@ -454,6 +481,10 @@ def create_artifact_record(job_id: str, artifact_type: str, title: str | None, c
                 generation_status,
                 ts,
                 ts,
+                None,
+                metadata.get('source_transcript_hash') if metadata else None,
+                0,
+                None,
             ),
         )
         conn.commit()
@@ -505,6 +536,21 @@ def persist_artifact_content(job_id: str, artifact_id: str, content: str, metada
 app = FastAPI(title="TheHand Transcription Server", version="1.0.0")
 
 init_db()
+
+
+@app.on_event("startup")
+async def resume_queued_artifacts():
+    """On startup, resume artifact generation for queued or running artifacts."""
+    logging.info("Startup: scanning for queued artifacts to resume")
+    with DB_LOCK, get_db_connection() as conn:
+        rows = conn.execute("SELECT artifact_id, job_id, artifact_type, generation_status FROM artifacts WHERE generation_status IN ('queued', 'running');").fetchall()
+        for r in rows:
+            rec = dict(r)
+            try:
+                logging.info(f"Resuming artifact {rec['artifact_id']} (status={rec['generation_status']})")
+                asyncio.create_task(generate_artifact_job(rec['artifact_id'], rec['job_id'], rec['artifact_type'], None))
+            except Exception:
+                logging.exception(f"Failed to resume artifact {rec['artifact_id']}")
 
 app.add_middleware(
     CORSMiddleware,
@@ -573,6 +619,30 @@ def update_job(job_id: str, **kwargs):
 
     if db_updates:
         update_db_job(job_id, db_updates)
+
+
+async def run_postprocessing_pipeline(job_id: str, defaults: list[str] | None = None):
+    """Orchestrator for post-transcription artifact generation.
+
+    Creates artifact records (if missing) and schedules background generation tasks.
+    """
+    logging.info(f"Postprocessing pipeline start for job {job_id}")
+    defaults = defaults or ['summary', 'chapter_map']
+    job = fetch_db_job(job_id)
+    if not job:
+        logging.warning(f"Postprocessing: job {job_id} not found")
+        return
+
+    transcript_hash = _compute_hash(job.get('transcript', {}).get('text'))
+    for art_type in defaults:
+        # create artifact record
+        title = f"{art_type} for {job_id}"
+        artifact_id = create_artifact_record(job_id, art_type, title, '', {'source_transcript_hash': transcript_hash}, generation_model=None, generation_status='queued')
+        logging.info(f"Created artifact {artifact_id} ({art_type}) for job {job_id}")
+        # schedule generation
+        asyncio.create_task(generate_artifact_job(artifact_id, job_id, art_type, None))
+
+    logging.info(f"Postprocessing pipeline scheduled for job {job_id}")
 
 # ---------------------------------------------------------------------------
 # Core pipeline
@@ -784,6 +854,9 @@ async def run_transcription_job(job_id: str, url: Optional[str], file_path: Opti
         # Persist artifacts, create semantic chunks, and finish
         persist_job_artifacts(job_id, transcript)
         create_chunks_for_job(job_id, transcript)
+        # compute transcript hash and persist
+        transcript_text = transcript.get('text') if isinstance(transcript, dict) else None
+        transcript_hash = _compute_hash(transcript_text)
         update_job(
             job_id,
             status="done",
@@ -791,7 +864,13 @@ async def run_transcription_job(job_id: str, url: Optional[str], file_path: Opti
             step="output",
             step_status="done",
             transcript=transcript,
+            transcript_hash=transcript_hash,
         )
+        # kick off autonomous postprocessing pipeline (summary, chapter_map)
+        try:
+            asyncio.create_task(run_postprocessing_pipeline(job_id))
+        except Exception as e:
+            logging.exception(f"Failed to start postprocessing for {job_id}: {e}")
 
     except Exception as exc:
         update_job(job_id, status="error", error=str(exc))
@@ -989,7 +1068,7 @@ async def api_get_artifact(artifact_id: str):
 async def generate_artifact_job(artifact_id: str, job_id: str, artifact_type: str, generation_model: str | None = None):
     """Background generator — mocked heuristics that produce artifact content and persist it."""
     try:
-        update_artifact_record(artifact_id, {'generation_status': 'running'})
+        update_artifact_record(artifact_id, {'generation_status': 'running', 'generation_attempts': 1, 'generation_started_at': _current_timestamp()})
 
         # load transcript and chunks
         job = fetch_db_job(job_id)
@@ -1065,15 +1144,20 @@ async def generate_artifact_job(artifact_id: str, job_id: str, artifact_type: st
             metadata = {'method': 'none'}
 
         # persist
+        start_ts = datetime.utcnow()
         persist_artifact_content(job_id, artifact_id, content, metadata)
         # update artifact record and add a version
-        update_artifact_record(artifact_id, {'generation_status': 'done', 'content': content, 'metadata_json': json.dumps(metadata)})
+        update_artifact_record(artifact_id, {'generation_status': 'done', 'content': content, 'metadata_json': json.dumps(metadata), 'generation_completed_at': _current_timestamp()})
+        duration_ms = int((datetime.utcnow() - start_ts).total_seconds() * 1000)
         with DB_LOCK, get_db_connection() as conn:
             conn.execute("INSERT INTO artifact_versions (artifact_id, version_number, content, metadata_json, created_at) VALUES (?, ?, ?, ?, ?);", (artifact_id, 1, content, json.dumps(metadata), _current_timestamp()))
+            conn.execute("UPDATE artifacts SET generation_attempts = generation_attempts + 1 WHERE artifact_id = ?;", (artifact_id,))
             conn.commit()
+        logging.info(f"Artifact {artifact_id} generated in {duration_ms}ms")
 
     except Exception as exc:
-        update_artifact_record(artifact_id, {'generation_status': 'error', 'content': str(exc)})
+        update_artifact_record(artifact_id, {'generation_status': 'error', 'generation_error': str(exc), 'content': ''})
+        logging.exception(f"Artifact generation failed for {artifact_id}: {exc}")
 
 
 @app.post("/api/job/{job_id}/generate/{artifact_type}")
