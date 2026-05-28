@@ -81,7 +81,7 @@ MODELS_DIR = os.environ.get(
 
 FRONTEND_DIR = os.environ.get(
     "FRONTEND_DIR",
-    str(Path(__file__).parent / "dist"),
+    str(Path(__file__).parent.parent / "app" / "dist"),
 )
 
 TEMP_DIR = Path(tempfile.gettempdir()) / "thehand"
