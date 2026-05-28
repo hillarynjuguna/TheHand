@@ -41,6 +41,7 @@ export default function Hero({ onJobDone }: HeroProps) {
   const [serverOk, setServerOk]         = useState<boolean | null>(null);
   const [models, setModels] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState<string>('small');
+  const [urlQueue, setUrlQueue] = useState<string[]>([]);
 
   useOrganicFlow(canvasRef);
 
@@ -61,6 +62,9 @@ export default function Hero({ onJobDone }: HeroProps) {
     }).catch(() => {});
     return () => { mounted = false; };
   }, []);
+
+  // When a job finishes, automatically process the next queued URL
+  // (moved below runRealTranscription to avoid referencing before declaration)
 
   // Check if the server is reachable on mount
   useEffect(() => {
@@ -128,7 +132,6 @@ export default function Hero({ onJobDone }: HeroProps) {
         let detail = '';
         try {
           const json = await res.json();
-          // FastAPI common validation detail shape
           if (json?.detail) {
             if (Array.isArray(json.detail)) {
               detail = json.detail.map((d: any) => d?.msg ?? JSON.stringify(d)).join('; ');
@@ -145,7 +148,6 @@ export default function Hero({ onJobDone }: HeroProps) {
         } catch (e) {
           try { detail = await res.text(); } catch { detail = ''; }
         }
-        // Map common validation messages to user-friendly strings
         const lower = (detail || '').toLowerCase();
         let friendly = `Server returned ${res.status}`;
         if (res.status === 422) {
@@ -159,8 +161,10 @@ export default function Hero({ onJobDone }: HeroProps) {
         }
         throw new Error(`${friendly}${detail ? ` (${detail})` : ''}`);
       }
+
       const { job_id } = await res.json();
       setJobId(job_id);
+
       // Try websocket for live updates; fallback to polling
       const wsUrl = `${API_BASE.replace(/^http/, 'ws')}/ws/job/${job_id}`;
       let ws: WebSocket | null = null;
@@ -187,8 +191,7 @@ export default function Hero({ onJobDone }: HeroProps) {
           } catch (e) { /* ignore malformed messages */ }
         };
         ws.onerror = () => { /* fall back */ };
-        ws.onclose = (e) => {
-          // if websocket never became useful, start polling
+        ws.onclose = () => {
           if (!usedWebsocket) startPolling(job_id);
         };
       } catch (e) {
@@ -215,12 +218,18 @@ export default function Hero({ onJobDone }: HeroProps) {
           } catch { /* ignore */ }
         }, 800);
       }
-
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Request failed');
       setIsTranscribing(false);
     }
-  }, []);
+  }, [selectedModel, onJobDone]);
+
+  function extractUrls(text: string): string[] {
+    if (!text) return [];
+    const regex = /https?:\/\/[\w\-./?=&%#]+/gi;
+    const matches = text.match(regex) || [];
+    return matches.map((s) => s.trim());
+  }
 
   const handleTranscribe = () => {
     if (isTranscribing) return;
@@ -229,12 +238,45 @@ export default function Hero({ onJobDone }: HeroProps) {
       inputRef.current?.focus();
       return;
     }
-    if (serverOk) {
-      runRealTranscription(url.trim());
-    } else {
-      runDemo();
+    // Extract URLs from the input; allow pasting text containing one or more links.
+    const found = extractUrls(url);
+    if (found.length === 0) {
+      setError('No valid URLs found in input. Paste a full link (https://...).');
+      inputRef.current?.focus();
+      return;
     }
+
+    // If already transcribing, append to the queue; otherwise start immediately and queue rest.
+    if (isTranscribing) {
+      setUrlQueue((q) => [...q, ...found]);
+      setError('Added to queue');
+      setUrl('');
+      return;
+    }
+
+    setUrl('');
+    if (found.length === 1) {
+      if (serverOk) runRealTranscription(found[0]);
+      else runDemo();
+      return;
+    }
+
+    // multiple links: start first, enqueue the rest
+    const [first, ...rest] = found;
+    setUrlQueue(rest);
+    if (serverOk) runRealTranscription(first);
+    else runDemo();
   };
+
+  // When a job finishes, automatically process the next queued URL
+  useEffect(() => {
+    if (!isTranscribing && urlQueue.length > 0) {
+      const next = urlQueue[0];
+      setUrlQueue((q) => q.slice(1));
+      if (serverOk) runRealTranscription(next);
+      else runDemo();
+    }
+  }, [isTranscribing, urlQueue, serverOk, runRealTranscription]);
 
   const handleFileUpload = () => {
     const input = document.createElement('input');
@@ -376,6 +418,9 @@ export default function Hero({ onJobDone }: HeroProps) {
                   {models.map((m) => <option key={m} value={m}>{m}</option>)}
                 </select>
               </div>
+            )}
+            {urlQueue.length > 0 && (
+              <div className="text-sm text-[#6B6560] mt-2">Queued links: {urlQueue.length}. They will be processed automatically.</div>
             )}
             <button
               ref={btnRef}
