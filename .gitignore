@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Server runtime data (never commit)
+server/data/
+server/dist/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Node / frontend
+node_modules/
+app/dist/
+app/.cache/
+*.local
+
+# Vite / build
+dist/
+*.tgz
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# Termux temp
+.thehand/tmp/
