@@ -6,7 +6,6 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SERVER_DIR="$REPO_DIR/server"
 PORT="${THEHAND_PORT:-8080}"
 
-# Parse --port flag
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --port) PORT="$2"; shift 2 ;;
@@ -14,15 +13,19 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Acquire wake lock so Android does not kill the process mid-transcription
 if command -v termux-wake-lock &>/dev/null; then
   echo "→ Acquiring termux-wake-lock..."
   termux-wake-lock
 fi
 
-echo "→ Starting TheHand server on port $PORT..."
-echo "   Open in browser: http://localhost:$PORT"
-echo "   From another device: http://$(hostname -I | awk '{print $1}'):$PORT"
+# Get local IP (Termux-safe)
+LOCAL_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')"
+
+echo "→ Starting TheHand on port $PORT..."
+echo "   Local:  http://localhost:$PORT"
+if [ -n "$LOCAL_IP" ]; then
+  echo "   Network: http://$LOCAL_IP:$PORT"
+fi
 echo "   Press Ctrl+C to stop."
 echo ""
 
